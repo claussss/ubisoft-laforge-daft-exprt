@@ -9,3 +9,13 @@ build/
 datasets/
 trainings/
 tmp/
+tmp_symbol_prosody/
+wav2vec2_checkpoints/
+scripts/style_bank/single/
+scripts/benchmarks/manifests/
+scripts/benchmarks/english/single_sentence.txt
+outputs/
+.cache/
+DaftExprt_LJ_ESD_22kHz.pt
+src/daft_exprt/vocoder/g_02500000_v1_uni
+src/daft_exprt/vocoder/generator_v1_lj

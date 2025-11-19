@@ -388,7 +388,8 @@ class ProsodyEncoder(nn.Module):
         else:
             self.post_multipliers = 1.
     
-    def forward(self, frames_energy, frames_pitch, mel_specs, speaker_ids, output_lengths):
+    def forward(self, frames_energy, frames_pitch, mel_specs, speaker_ids, output_lengths,
+                neutralize_prosody=False, neutralize_speaker_encoder=False):
         ''' Forward function of Prosody Encoder:
             frames_energy = (B, T_max)
             frames_pitch = (B, T_max)
@@ -417,27 +418,70 @@ class ProsodyEncoder(nn.Module):
             outputs = block(outputs, None, mask)  # (B, T_max, hidden_embed_dim)
         # average pooling on the whole time sequence
         outputs = torch.sum(outputs, dim=1) / output_lengths.unsqueeze(1)  # (B, hidden_embed_dim)
+        
         # store prosody embeddings
         prosody_embeddings = outputs  # (B, hidden_embed_dim)
-        # encode speaker IDs and add
-        speaker_ids = self.spk_embedding(speaker_ids)  # (B, hidden_embed_dim)
-        outputs = outputs + speaker_ids  # (B, hidden_embed_dim)
         
-        # project outputs to predict all FiLM parameters
-        gammas = self.gammas_predictor(outputs)  # (B, nb_tot_film_params)
-        betas = self.betas_predictor(outputs)  # (B, nb_tot_film_params)
+        # neutralize prosody if requested (Global Neutralization)
+        if neutralize_prosody:
+            prosody_embeddings = torch.zeros_like(prosody_embeddings)
+            outputs = torch.zeros_like(outputs)
+
+        # encode speaker IDs
+        speaker_ids_emb = self.spk_embedding(speaker_ids)  # (B, hidden_embed_dim)
+        
+        # Prepare embeddings for projection
+        # Case 1: Standard / Frame Decoder (Speaker Active)
+        # Combined = (Ref or 0) + Speaker
+        outputs_speaker = outputs + speaker_ids_emb
+
+        # Case 2: Fully Neutral (Speaker Inactive) - for Phoneme Encoder if requested
+        # Combined = (Ref or 0) + 0
+        # Note: If neutralize_prosody is False, this still contains Ref. 
+        # But the user requirement implies we want to remove speaker influence specifically.
+        # If neutralize_speaker_encoder is True, we want (Ref or 0) + 0.
+        outputs_neutral = outputs 
+
+        # Helper to project embeddings to FiLM params
+        def project_film(emb):
+            g = self.gammas_predictor(emb)
+            b = self.betas_predictor(emb)
+            return g, b
+
+        # Project both
+        gammas_spk, betas_spk = project_film(outputs_speaker)
+        gammas_neu, betas_neu = project_film(outputs_neutral)
+
         # split FiLM parameters per FiLM-ed module
         modules_film_params = []
         column_idx, block_idx = 0, 0
-        for _, module_params in self.module_params.items():
+        
+        # We need to know which module corresponds to which index in module_params
+        # self.module_params order: 'encoder', 'prosody_predictor', 'decoder'
+        # We want to use 'neutral' params for 'encoder' if neutralize_speaker_encoder is True
+        # We want to use 'speaker' params for 'decoder' (and likely prosody_predictor?)
+        # The user said: "zero out speaker embedding, but only for phoneme encoder"
+        # So: Encoder -> Neutral (if flag), Others -> Speaker
+        
+        module_names = list(self.module_params.keys())
+        
+        for module_name, module_params in self.module_params.items():
             nb_blocks, conv_channels = module_params
             module_nb_film_params = nb_blocks * conv_channels
-            module_gammas = gammas[:, column_idx: column_idx + module_nb_film_params]  # (B, module_nb_film_params)
-            module_betas = betas[:, column_idx: column_idx + module_nb_film_params]  # (B, module_nb_film_params)
+            
+            # Select source gammas/betas
+            if module_name == 'encoder' and neutralize_speaker_encoder:
+                cur_gammas = gammas_neu[:, column_idx: column_idx + module_nb_film_params]
+                cur_betas = betas_neu[:, column_idx: column_idx + module_nb_film_params]
+            else:
+                cur_gammas = gammas_spk[:, column_idx: column_idx + module_nb_film_params]
+                cur_betas = betas_spk[:, column_idx: column_idx + module_nb_film_params]
+
             # split FiLM parameters for each block in the module
-            B = module_gammas.size(0)
-            module_gammas = module_gammas.view(B, nb_blocks, -1)  # (B, nb_blocks, block_nb_film_params)
-            module_betas = module_betas.view(B, nb_blocks, -1)  # (B, nb_blocks, block_nb_film_params)
+            B = cur_gammas.size(0)
+            module_gammas = cur_gammas.view(B, nb_blocks, -1)  # (B, nb_blocks, block_nb_film_params)
+            module_betas = cur_betas.view(B, nb_blocks, -1)  # (B, nb_blocks, block_nb_film_params)
+            
             # predict gammas in the delta regime, i.e. predict deviation from unity
             # add gamma scalar L2 penalized post-multiplier for each block
             if self.post_mult_weight != 0.:
@@ -461,7 +505,15 @@ class ProsodyEncoder(nn.Module):
             column_idx += module_nb_film_params
         encoder_film, prosody_pred_film, decoder_film = modules_film_params
         
-        return prosody_embeddings, encoder_film, prosody_pred_film, decoder_film
+        # For speaker classifier, we usually want the full embedding (Ref + Speaker)
+        # But if we neutralized ref, it's just Speaker.
+        # If we neutralized speaker (for encoder), it doesn't affect this return value directly
+        # unless we want to return the 'neutral' one. 
+        # The speaker classifier is used in forward() but not inference().
+        # In inference(), we don't use spk_preds.
+        # So returning outputs_speaker (which is Ref+Spk or 0+Spk) is correct for general consistency.
+        
+        return outputs_speaker, encoder_film, prosody_pred_film, decoder_film
 
 
 class PhonemeEncoder(nn.Module):
@@ -863,7 +915,8 @@ class DaftExprt(nn.Module):
         
         return pitch_preds
     
-    def inference(self, inputs, pitch_transform, hparams):
+    def inference(self, inputs, pitch_transform, hparams, external_prosody=None,
+                  neutralize_prosody=False, neutralize_speaker_encoder=False):
         ''' Inference function of DaftExprt
         '''
         # symbols = (B, L_max)
@@ -881,28 +934,48 @@ class DaftExprt(nn.Module):
         
         # extract FiLM parameters from reference and speaker ID
         # (B, nb_blocks, nb_film_params)
-        _, encoder_film, prosody_pred_film, decoder_film = self.prosody_encoder(energy_refs, pitch_refs, mel_spec_refs, speaker_ids, ref_lengths)
+        _, encoder_film, prosody_pred_film, decoder_film = self.prosody_encoder(
+            energy_refs, pitch_refs, mel_spec_refs, speaker_ids, ref_lengths,
+            neutralize_prosody=neutralize_prosody,
+            neutralize_speaker_encoder=neutralize_speaker_encoder
+        )
         # embed phoneme symbols, add positional encoding and encode input sequence
         enc_outputs = self.phoneme_encoder(symbols, encoder_film, input_lengths)  # (B, L_max, hidden_embed_dim)
         # predict prosody parameters
-        duration_preds, energy_preds, pitch_preds = self.prosody_predictor(enc_outputs, prosody_pred_film, input_lengths)  # (B, L_max)
-        
-        # multiply durations by duration factors and extract int durations
-        duration_preds *= dur_factors  # (B, L_max)
-        duration_preds, durations_int = self.get_int_durations(duration_preds, hparams)  # (B, L_max)
-        # add energy factors to energies
-        # set 0 energy for symbols with 0 duration
-        energy_preds *= energy_factors  # (B, L_max)
-        energy_preds[durations_int == 0] = 0.  # (B, L_max)
-        # set unvoiced pitch for symbols with 0 duration
-        # apply pitch factors using specified transformation
-        pitch_preds[durations_int == 0] = 0.
-        if pitch_transform == 'add':
-            pitch_preds = self.pitch_shift(pitch_preds, pitch_factors, hparams, speaker_ids)  # (B, L_max)
-        elif pitch_transform == 'multiply':
-            pitch_preds = self.pitch_multiply(pitch_preds, pitch_factors)  # (B, L_max)
+        # TODO: If I could pass energy, durations, pitch extracted from audio instead of predicting, it would help me to just have controllable TTS
+        if external_prosody is None:
+            duration_preds, energy_preds, pitch_preds = self.prosody_predictor(enc_outputs, prosody_pred_film, input_lengths)  # (B, L_max)
+            # multiply durations by duration factors and extract int durations
+            duration_preds *= dur_factors  # (B, L_max)
+            duration_preds, durations_int = self.get_int_durations(duration_preds, hparams)  # (B, L_max)
+            # add energy factors to energies
+            energy_preds *= energy_factors  # (B, L_max)
+            # set 0 energy for symbols with 0 duration
+            energy_preds[durations_int == 0] = 0.  # (B, L_max)
+            # set unvoiced pitch for symbols with 0 duration
+            pitch_preds[durations_int == 0] = 0.
+            # apply pitch factors using specified transformation
+            if pitch_transform == 'add':
+                pitch_preds = self.pitch_shift(pitch_preds, pitch_factors, hparams, speaker_ids)  # (B, L_max)
+            elif pitch_transform == 'multiply':
+                pitch_preds = self.pitch_multiply(pitch_preds, pitch_factors)  # (B, L_max)
+            else:
+                raise NotImplementedError
         else:
-            raise NotImplementedError
+            duration_preds = external_prosody['duration_preds']
+            durations_int = external_prosody['durations_int']
+            energy_preds = external_prosody['energy_preds']
+            pitch_preds = external_prosody['pitch_preds']
+            energy_preds *= energy_factors
+            # external values are already normalized, so only enforce masking
+            energy_preds[durations_int == 0] = 0.
+            pitch_preds[durations_int == 0] = 0.
+            if pitch_transform == 'add':
+                pitch_preds = self.pitch_shift(pitch_preds, pitch_factors, hparams, speaker_ids)
+            elif pitch_transform == 'multiply':
+                pitch_preds = self.pitch_multiply(pitch_preds, pitch_factors)
+            else:
+                raise NotImplementedError
         
         # perform Gaussian upsampling on symbols sequence
         # symbols_upsamp = (B, T_max, hidden_embed_dim)

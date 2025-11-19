@@ -218,7 +218,55 @@ The script also offers the possibility to:
 - `--batch_size`: process batch of sentences in parallel
 - `--real_time_factor`: estimate Daft-Exprt real time factor performance given the chosen batch size
 - `--control`: perform local prosody control
+- `--symbol_prosody_file`: bypass phonemization/prosody prediction by supplying tuples generated with `extract_symbol_prosody.py`
+- `--use_griffin_lim`: keep the legacy Griffin-Lim reconstruction (otherwise a universal HiFi-GAN vocoder is used automatically)
+- `--vocoder_checkpoint`: provide a custom HiFi-GAN generator checkpoint; if omitted, a pretrained universal 22kHz model is downloaded on demand
 
+### Symbol-Level Prosody Extraction
+Use [extract_symbol_prosody.py](scripts/extract_symbol_prosody.py) to align raw audio with its transcript and export per-symbol duration, pitch, and energy tuples that mirror the targets of the local prosody predictor. The script:
+- reads a manifest where each line contains `absolute/path/to/audio.wav|verbatim transcript`
+- looks up words in the provided MFA dictionary first, only running MFA G2P for out-of-vocabulary words (either `--g2p_preset american_english|indian_english` or `--g2p_model /path/to/model.zip`)
+- runs Montreal Forced Aligner with the provided (or auto-generated) dictionary and MFA acoustic model
+- extracts mel spectrograms, REAPER pitch, and converts frame-level values to phoneme-level tuples `(symbol, duration_in_frames, mean_pitch, mean_energy)`
+
+Dependencies: MFA CLI (`mfa align` / `mfa g2p`), the matching acoustic/G2P packages (download with `mfa download acoustic ...` / `mfa download g2p ...`), and the `reaper` binary for F0 extraction. Provide an MFA dictionary via `--dictionary` or let the script reuse the default one bundled with the pretrained model.
+
+Example:
+```
+python scripts/extract_symbol_prosody.py \
+    --manifest /path/to/list.txt \
+    --output /tmp/prosody.txt \
+    --g2p_preset american_english \
+    --nb_jobs 4 \
+    --include_audio_path
+```
+Output file `/tmp/prosody.txt` will contain one line per audio. Each line is a Python-style list of tuples; optionally the original audio path is prefixed when `--include_audio_path` is set:
+```
+/abs/audio.wav|[('DH', 5, 3.512, 1.104), ('AH0', 4, 3.403, 1.089), ('S', 3, 0.000, 0.982), ...]
+```
+Pass `--mix_output False` if you instead need four parallel arrays (symbols, durations, pitch, energy):
+```
+/abs/audio.wav|(['DH', 'AH0', 'S', ...], [5, 4, 3, ...], [3.512, 3.403, 0.0, ...], [1.104, 1.089, 0.982, ...])
+```
+These tuples can replace the local prosody predictor outputs when performing deterministic prosody control.
+
+## Evaluation Utilities
+
+### WER and Accent Confidence Tracking
+To benchmark accent conversion quality we provide `scripts/evaluation/compute_wer_and_accent_metrics.py`.  
+It ingests two manifests (pre- and post-conversion) formatted as `utt_id|/abs/or/rel/path.wav|Reference transcript` (or without the `utt_id`, where the filename stem is used), transcribes the converted audio with an OpenAI Whisper checkpoint, and scores both audio versions with the SpeechBrain `Jzuluaga/accent-id-commonaccent_xlsr-en-english` custom interface. The script emits a JSON report that lists per-utterance WER, transcripts, and source/target accent confidences (with deltas), plus global micro WER and average confidence shifts. If `--plot-path` is provided an overlapping histogram of the predicted accent class distributions before vs. after conversion is also saved.
+
+```
+python scripts/evaluation/compute_wer_and_accent_metrics.py \
+    --before-manifest /path/to/source_manifest.txt \
+    --after-manifest /path/to/converted_manifest.txt \
+    --source-class indian \
+    --target-class american \
+    --output-json outputs/indian_to_american_metrics.json \
+    --plot-path outputs/indian_to_american_hist.png
+```
+
+Key options let you pick which Whisper size to run (`--whisper-model`), choose where the SpeechBrain cache lives (`--accent-cache-dir`), change the manifest separator, disable accent prediction caching (`--disable-accent-cache`), set an artifact prefix (`--experiment-name`), or cap the number of processed utterances (useful for smoke tests). Relative audio paths are resolved against their manifest location, and both manifests must expose the same utterance identifiers in the same order. Source/target accents should be one of the CommonAccent labels used by the classifier (`united_states`, `england`, `australia`, `india`, `canada`, `bermuda`, `scotland`, `africa`, `ireland`, `new_zealand`, `wales`, `malaysia`, `philippines`, `singapore`, `hong_kong`, `south_atlantic`), with common synonyms like `american` automatically mapped.
 
 ## Citation
 ```

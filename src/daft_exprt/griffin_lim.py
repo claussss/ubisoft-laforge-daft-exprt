@@ -192,7 +192,7 @@ def griffin_lim_reconstruction_from_mel_spec(mel_spec, hparams, logger):
     waveform = []
     if len(linear_spec.shape) == 2:
         waveform, _ = reconstruct_signal_griffin_lim(linear_spec[:, :-2], hparams.hop_length,
-                                                     iterations=30, logger=logger)
+                                                     iterations=500, logger=logger)
         waveform = waveform / np.max(abs(waveform))
 
     return waveform

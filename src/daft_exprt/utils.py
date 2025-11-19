@@ -4,6 +4,8 @@ import sys
 import threading
 import time
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from functools import partial
@@ -189,6 +191,9 @@ def launch_multi_process(iterable, func, n_jobs, chunksize=1, ordered=True, time
 
     :return: function outputs
     """
+    if n_jobs == 1:
+        func = partial(func, log_queue=None, **kwargs)
+        return [func(x) for x in iterable]
     # set up a queue and listen to log messages on it in another thread
     m = mp.Manager()
     q = m.Queue()
