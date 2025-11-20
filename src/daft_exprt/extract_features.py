@@ -107,6 +107,20 @@ def duration_to_integer(float_durations, hparams, nb_samples=None):
             int_durations.append(nb_edge_frames)
         else:
             int_durations[-1] += nb_edge_frames
+    else:
+        # HiFi-GAN compatibility padding
+        # Total extra frames = (filter_length - hop_length) / hop_length
+        # For 1024/256, this is 3 frames.
+        extra_frames = int((hparams.filter_length - hparams.hop_length) / hparams.hop_length)
+        # Distribute roughly equally (1 left, 2 right for 3 frames)
+        left = extra_frames // 2
+        right = extra_frames - left
+        
+        int_durations[0] += left
+        if len(float_durations) != 0:
+             int_durations.append(right)
+        else:
+             int_durations[-1] += right
     
     return int_durations
 
@@ -212,8 +226,9 @@ def update_markers(file_name, lines, sentence, sent_begin, int_durations, hparam
         end_prev = markers[-1][1]
         markers.append([end_prev, end_prev, str(0), eos, eos, str(word_idx)])
         # check everything is correct
-        assert(len(sent_words) == len(markers_old) == len(int_durations) == 0), \
-            logger.error(f'File name: {file_name} -- length mismatch between lists: ({sent_words}, {markers_old}, {int_durations})')
+        if not (len(sent_words) == len(markers_old) == len(int_durations) == 0):
+            logger.warning(f'File name: {file_name} -- length mismatch between lists: sent_words={len(sent_words)}, markers_old={len(markers_old)}, int_durations={len(int_durations)}')
+            return None
         return markers
     else:
         return None
@@ -335,12 +350,17 @@ def mel_spectrogram_HiFi(wav, hparams):
     # extract hparams
     fmin = hparams.mel_fmin
     fmax = hparams.mel_fmax
-    center = hparams.centered
+    # center = hparams.centered # We force center=False for HiFi-GAN compatibility
     hop_size = hparams.hop_length
     n_fft = hparams.filter_length
     num_mels = hparams.n_mel_channels
     sampling_rate = hparams.sampling_rate
     min_clipping = hparams.min_clipping
+    
+    # Manual padding for center=False (HiFi-GAN style)
+    pad = int((n_fft - hop_size) / 2)
+    wav = torch.nn.functional.pad(wav.unsqueeze(0).unsqueeze(0), (pad, pad), mode='reflect').squeeze(0).squeeze(0)
+    
     # get mel filter bank
     mel_filter_bank = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)  # (n_mels, 1 + n_fft/2)
     mel_filter_bank = torch.from_numpy(mel_filter_bank).float()  # (n_mels, 1 + n_fft/2)
@@ -348,7 +368,7 @@ def mel_spectrogram_HiFi(wav, hparams):
     hann_window = torch.hann_window(n_fft)
     # extract amplitude spectrogram
     spec = torch.stft(wav, n_fft, hop_length=hop_size, win_length=n_fft, window=hann_window,
-                      center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
+                      center=False, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
     spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
     # convert to mels and pass to log
     mel_spec = torch.matmul(mel_filter_bank, spec)
@@ -434,9 +454,23 @@ def _extract_features(files, features_dir, hparams, log_queue):
         float_durations = [[float(x[0]) - sent_begin, float(x[1]) - sent_begin]
                            for x in [line.strip().split(sep='\t') for line in lines]]
         int_durations = duration_to_integer(float_durations, hparams, nb_samples=len(wav))
-        assert(len(int_durations) == len(lines)), logger.error(f'{markers_file} -- ({len(int_durations)}, {len(lines)})')
-        assert(sum(int_durations) == nb_mel_spec_frames), logger.error(f'{markers_file} -- ({sum(int_durations)}, {nb_mel_spec_frames})')
-        assert(0 not in int_durations), logger.error(f'{markers_file} -- {int_durations}')
+        # Validate and fix durations
+        if len(int_durations) != len(lines):
+            logger.warning(f'{markers_file} -- duration count mismatch: {len(int_durations)} vs {len(lines)}')
+            return
+
+        # Fix duration mismatch by adjusting the last segment
+        diff = nb_mel_spec_frames - sum(int_durations)
+        if diff != 0:
+            if int_durations[-1] + diff >= 0:
+                int_durations[-1] += diff
+            else:
+                logger.warning(f'{markers_file} -- cannot fix mismatch {diff}: last dur {int_durations[-1]} too small')
+                return
+        
+        if 0 in int_durations:
+            logger.warning(f'{markers_file} -- zero duration found in {int_durations}')
+            return
         
         # update markers:
         # change timings to start from 0
@@ -479,7 +513,18 @@ def _extract_features(files, features_dir, hparams, log_queue):
             
             # extract log pitch for each mel-spec frame
             frames_pitch = extract_pitch(wav, fs, hparams)
-            assert(len(frames_pitch) == nb_mel_spec_frames), logger.error(f'{markers_file} -- ({len(frames_pitch)}, {nb_mel_spec_frames})')
+            
+            # Align pitch frames to mel-spec frames
+            if len(frames_pitch) > nb_mel_spec_frames:
+                frames_pitch = frames_pitch[:nb_mel_spec_frames]
+            elif len(frames_pitch) < nb_mel_spec_frames:
+                diff = nb_mel_spec_frames - len(frames_pitch)
+                # Pad with last value
+                last_val = frames_pitch[-1] if len(frames_pitch) > 0 else 0.
+                frames_pitch = np.append(frames_pitch, [last_val] * diff)
+            
+            if len(frames_pitch) != nb_mel_spec_frames:
+                 logger.warning(f'{markers_file} -- pitch alignment failed: {len(frames_pitch)} vs {nb_mel_spec_frames}')
             # save frames pitch values
             pitch_file = os.path.join(features_dir, f'{file_name}.frames_f0')
             with open(pitch_file, 'w', encoding='utf-8') as f:

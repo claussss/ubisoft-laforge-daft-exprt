@@ -6,7 +6,7 @@ build/
 
 
 #################### Daft-Exprt #####################
-datasets/
+datasets
 trainings/
 tmp/
 tmp_symbol_prosody/

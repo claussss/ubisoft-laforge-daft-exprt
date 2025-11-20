@@ -111,7 +111,7 @@ def train(train_args):
                '--world_size', f'{train_args.world_size}',
                '--rank', f'{train_args.rank}',
                '--master', f'{train_args.master}']
-    if not train_args.no_multiprocessing_distributed:
+    if not train_args.no_multiprocessing_distributed and hparams.device != 'cpu':
         process.append('--multiprocessing_distributed')
     call(process)
 
@@ -164,6 +164,8 @@ if __name__ == '__main__':
                               help='node rank for distributed training')
     parser_train.add_argument('-m', '--master', type=str, default='tcp://localhost:54321',
                               help='url used to set up distributed training')
+    parser_train.add_argument('--cpu', action='store_true',
+                              help='Use CPU for training (useful for debugging)')
     
     parser_fine_tune = subparsers.add_parser('fine_tune', help='generate data sets with the Daft-Exprt trained model for vocoder fine-tuning')
     parser_fine_tune.set_defaults(func=fine_tune)
@@ -194,6 +196,7 @@ if __name__ == '__main__':
     }
     # fill hparams dictionary to overwrite default hyper-param values
     hparams_kwargs['checkpoint'] = args.checkpoint if hasattr(args, 'checkpoint') else ''
+    hparams_kwargs['device'] = 'cpu' if hasattr(args, 'cpu') and args.cpu else 'cuda'
     
     # create hyper-params object and save config parameters
     hparams = HyperParams(**hparams_kwargs)

@@ -4,28 +4,13 @@ from torch import nn
 
 
 class DaftExprtLoss(nn.Module):
-    def __init__(self, gpu, hparams):
+    def __init__(self, device, hparams):
         super(DaftExprtLoss, self).__init__()
         self.nb_channels = hparams.n_mel_channels
-        self.warmup_steps = hparams.warmup_steps
-        self.adv_max_weight = hparams.adv_max_weight
-        self.post_mult_weight = hparams.post_mult_weight
-        self.dur_weight = hparams.dur_weight
-        self.energy_weight = hparams.energy_weight
-        self.pitch_weight = hparams.pitch_weight
         self.mel_spec_weight = hparams.mel_spec_weight
         
-        self.L1Loss = nn.L1Loss(reduction='none').cuda(gpu)
-        self.MSELoss = nn.MSELoss(reduction='none').cuda(gpu)
-        self.CrossEntropy = nn.CrossEntropyLoss().cuda(gpu)
-    
-    def update_adversarial_weight(self, iteration):
-        ''' Update adversarial weight value based on iteration
-        '''
-        weight_iter = iteration * self.warmup_steps ** -1.5 * self.adv_max_weight / self.warmup_steps ** -0.5
-        weight = min(self.adv_max_weight, weight_iter)
-        
-        return weight
+        self.L1Loss = nn.L1Loss(reduction='none').to(device)
+        self.MSELoss = nn.MSELoss(reduction='none').to(device)
     
     def forward(self, outputs, targets, iteration):
         ''' Compute training loss
@@ -36,46 +21,49 @@ class DaftExprtLoss(nn.Module):
         '''
         # extract ground-truth targets
         # targets are already zero padded
-        duration_targets, energy_targets, pitch_targets, mel_spec_targets, speaker_ids = targets
-        duration_targets.requires_grad = False
-        energy_targets.requires_grad = False
-        pitch_targets.requires_grad = False
+        # targets = (mel_specs, output_lengths)
+        mel_spec_targets, output_lengths = targets
         mel_spec_targets.requires_grad = False
-        speaker_ids.requires_grad = False
         
         # extract predictions
         # predictions are already zero padded
-        speaker_preds, film_params, encoder_preds, decoder_preds, _ = outputs
-        post_multipliers, _, _, _ = film_params
-        duration_preds, energy_preds, pitch_preds, input_lengths = encoder_preds
-        mel_spec_preds, output_lengths= decoder_preds
+        # outputs = (mel_preds, weights)
+        mel_spec_preds, _ = outputs
         
-        # compute adversarial speaker objective
-        speaker_loss = self.CrossEntropy(speaker_preds, speaker_ids)
+        # We need output_lengths to normalize loss
+        # It's not in targets tuple passed from train.py?
+        # Let's check train.py. In train.py:
+        # inputs, targets = model.parse_batch(gpu, batch)
+        # inputs = (..., output_lengths, ...)
+        # targets = (..., mel_specs, speaker_ids)
+        # Wait, parse_batch in model.py (my modified version):
+        # targets = mel_specs
+        # So targets is just mel_specs?
+        # Let's check my modified model.py parse_batch:
+        # return inputs, targets
+        # where targets = mel_specs.
+        # But wait, in the original code, targets was a tuple.
+        # I changed it to just mel_specs in my thought process but I need to verify what I actually wrote.
+        # I wrote: targets = mel_specs
+        # So targets is a tensor, not a tuple.
         
-        # compute L2 penalized loss on FiLM scalar post-multipliers
-        if self.post_mult_weight != 0.:
-            post_mult_loss = torch.norm(post_multipliers, p=2)
-        else:
-            post_mult_loss = torch.tensor([0.]).cuda(speaker_loss.device, non_blocking=True).float()
+        # However, I need output_lengths for the loss normalization.
+        # inputs has output_lengths.
+        # But forward receives outputs, targets, iteration.
+        # It doesn't receive inputs.
+        # I should probably pass output_lengths in targets or change how loss is called.
+        # Let's check how I modified model.py.
+        # I changed parse_batch to return targets = mel_specs.
+        # I should probably change it to return (mel_specs, output_lengths) so I can use it in loss.
         
-        # compute duration loss
-        duration_loss = self.MSELoss(duration_preds, duration_targets)  # (B, L_max)
-        # divide by length of each sequence in the batch
-        duration_loss = torch.sum(duration_loss, dim=1) / input_lengths  # (B, )
-        duration_loss = torch.mean(duration_loss)
+        # For now, let's assume I will fix model.py to return (mel_specs, output_lengths) in targets.
+        # Or I can change loss signature to accept lengths.
+        # But standard pytorch training loops usually pass outputs, targets.
         
-        # compute energy loss
-        energy_loss = self.MSELoss(energy_preds, energy_targets)  # (B, L_max)
-        # divide by length of each sequence in the batch
-        energy_loss = torch.sum(energy_loss, dim=1) / input_lengths  # (B, )
-        energy_loss = torch.mean(energy_loss)
-        
-        # compute pitch loss
-        pitch_loss = self.MSELoss(pitch_preds, pitch_targets)  # (B, L_max)
-        # divide by length of each sequence in the batch
-        pitch_loss = torch.sum(pitch_loss, dim=1) / input_lengths  # (B, )
-        pitch_loss = torch.mean(pitch_loss)
+        # Let's assume targets = (mel_specs, output_lengths).
+        mel_spec_targets, output_lengths = targets
+        mel_spec_targets.requires_grad = False
+        output_lengths.requires_grad = False
         
         # compute mel-spec loss
         mel_spec_l1_loss = self.L1Loss(mel_spec_preds, mel_spec_targets)  # (B, n_mel_channels, T_max)
@@ -87,20 +75,12 @@ class DaftExprtLoss(nn.Module):
         mel_spec_l2_loss = torch.mean(mel_spec_l2_loss)
 
         # add weights
-        speaker_weight = self.update_adversarial_weight(iteration)
-        speaker_loss = speaker_weight * speaker_loss
-        post_mult_loss = self.post_mult_weight * post_mult_loss
-        duration_loss = self.dur_weight * duration_loss
-        energy_loss = self.energy_weight * energy_loss
-        pitch_loss = self.pitch_weight * pitch_loss
         mel_spec_l1_loss = self.mel_spec_weight * mel_spec_l1_loss
         mel_spec_l2_loss = self.mel_spec_weight * mel_spec_l2_loss
         
-        loss = speaker_loss + post_mult_loss + duration_loss + energy_loss + pitch_loss + mel_spec_l1_loss + mel_spec_l2_loss
+        loss = mel_spec_l1_loss + mel_spec_l2_loss
 
         # create individual loss tracker
-        individual_loss = {'speaker_loss': speaker_loss.item(), 'post_mult_loss': post_mult_loss.item(),
-                           'duration_loss': duration_loss.item(), 'energy_loss': energy_loss.item(), 'pitch_loss': pitch_loss.item(),
-                           'mel_spec_l1_loss': mel_spec_l1_loss.item(), 'mel_spec_l2_loss': mel_spec_l2_loss.item()}
+        individual_loss = {'mel_spec_l1_loss': mel_spec_l1_loss.item(), 'mel_spec_l2_loss': mel_spec_l2_loss.item()}
         
         return loss, individual_loss

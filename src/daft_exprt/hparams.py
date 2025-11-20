@@ -36,7 +36,7 @@ class HyperParams(object):
         self.minimum_wav_duration = 1000  # minimum duration (ms) of the audio files used for training
         
         # mel-spec extraction hyper-parameters
-        self.centered = True  # extraction window is centered on the time step when doing FFT
+        self.centered = False  # extraction window is centered on the time step when doing FFT
         self.min_clipping = 1e-5  # min clipping value when creating mel-specs
         self.sampling_rate = 22050  # sampling rate of the audios in the data set
         self.mel_fmin = 0  # lowest frequency (in Hz) of the mel-spectrogram
@@ -59,6 +59,7 @@ class HyperParams(object):
         self.cudnn_enabled = True  # parameter used when initializing training
         self.cudnn_benchmark = False  # parameter used when initializing training
         self.cudnn_deterministic = True  # parameter used when initializing training
+        self.device = 'cuda'  # device to use for training ('cuda' or 'cpu')
         self.dist_backend = 'nccl'  # parameter used to perform distributed training
         self.nb_iterations = 370000  # total number of iterations to perform during training
         self.iters_per_checkpoint = 10000  # number of iterations between successive checkpoints
@@ -68,35 +69,25 @@ class HyperParams(object):
         self.checkpoint = ''  # checkpoint to use to restart training at a specific place
         
         # loss weigths hyper-parameters
-        self.lambda_reversal = 1.  # lambda multiplier used in reversal gradient layer
-        self.adv_max_weight = 1e-2  # max weight to apply on speaker adversarial loss
         self.post_mult_weight = 1e-3  # weight to apply on FiLM scalar post-multipliers
-        self.dur_weight = 1.  # weight to apply on duration loss
-        self.energy_weight = 1.  # weight to apply on energy loss
-        self.pitch_weight = 1.  # weight to apply on pitch loss
         self.mel_spec_weight = 1.  # weight to apply on mel-spec loss
         
-        # optimizer hyper-parameters
-        self.optimizer = 'adam'  # optimizer to use for training
-        self.betas = (0.9, 0.98)  # betas coefficients in Adam
-        self.epsilon = 1e-9  # used for numerical stability in Adam
-        self.weight_decay = 1e-6  # weight decay (L2 regularization) to use in the optimizer
-        self.initial_learning_rate = 1e-4  # value of learning rate at iteration 0
-        self.max_learning_rate = 1e-3  # max value of learning rate during training
+        # optimization parameters
+        self.optimizer = 'adam'  # 'adam', 'sgd'
+        self.batch_size = 2
+        self.accumulation_steps = 1
+        self.betas = [0.9, 0.98]
+        self.epsilon = 1e-9
+        self.weight_decay = 1e-6
+        self.grad_clip_thresh = float('inf')
+        self.initial_learning_rate = 1e-4
+        self.max_learning_rate = 1e-3
         self.warmup_steps = 10000  # linearly increase the learning rate for the first warmup steps
-        self.grad_clip_thresh = float('inf')  # gradient clipping threshold to stabilize training
+        self.nb_iterations = 370000
+        self.iters_per_checkpoint = 10
+        self.iters_check_for_model_improvement = 5000
         
         # Daft-Exprt module hyper-parameters
-        self.prosody_encoder = {
-            'nb_blocks': 4,
-            'hidden_embed_dim': 128,
-            'attn_nb_heads': 8,
-            'attn_dropout': 0.1,
-            'conv_kernel': 3,
-            'conv_channels': 1024,
-            'conv_dropout': 0.1
-        }
-        
         self.phoneme_encoder = {
             'nb_blocks': 4,
             'hidden_embed_dim': 128,
@@ -105,13 +96,6 @@ class HyperParams(object):
             'conv_kernel': 3,
             'conv_channels': 1024,
             'conv_dropout': 0.1
-        }
-        
-        self.local_prosody_predictor = {
-            'nb_blocks': 1,
-            'conv_kernel': 3,
-            'conv_channels': 256,
-            'conv_dropout': 0.1,
         }
         
         self.gaussian_upsampling_module = {
