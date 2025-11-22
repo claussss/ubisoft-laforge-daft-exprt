@@ -6,6 +6,7 @@ import torch
 
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+import torch.nn.functional as F
 
 
 class DaftExprtDataLoader(Dataset):
@@ -146,8 +147,152 @@ class DaftExprtDataLoader(Dataset):
             print(f"Duration sum: {torch.sum(durations_int)}, Mel len: {mel_spec.size(1)}")
         assert(torch.sum(durations_int) == mel_spec.size(1))
         
+        # Apply augmentation if enabled
+        if hasattr(self.hparams, 'aug_prob') and self.hparams.aug_prob > 0:
+            if random.random() < self.hparams.aug_prob:
+                symbols, durations_float, durations_int, symbols_energy, symbols_pitch, \
+                frames_energy, frames_pitch, mel_spec = self._augment_data(
+                    symbols, durations_float, durations_int, symbols_energy, symbols_pitch,
+                    frames_energy, frames_pitch, mel_spec, speaker_id
+                )
+
         return symbols, durations_float, durations_int, symbols_energy, symbols_pitch, \
             frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file
+    
+    def _augment_data(self, symbols, durations_float, durations_int, symbols_energy, symbols_pitch,
+                      frames_energy, frames_pitch, mel_spec, speaker_id):
+        ''' Apply random prosody augmentation
+        '''
+        # 1. Pitch Shift (Bin-First Logic)
+        if hasattr(self.hparams, 'max_mel_shift') and self.hparams.max_mel_shift > 0:
+            # Randomly select integer bin shift
+            shift_bins = random.randint(-self.hparams.max_mel_shift, self.hparams.max_mel_shift)
+            
+            if shift_bins != 0:
+                # Calculate approximate semitone shift
+                # Approximation: 1 Mel Bin ~= 0.7 Semitones
+                semitones = shift_bins * 0.7
+                
+                pitch_std = self.hparams.stats[f'spk {speaker_id}']['pitch']['std']
+                if pitch_std > 0:
+                    shift_val = (semitones / 12.0) * np.log(2) / pitch_std
+                    
+                    # Apply to symbols_pitch (only voiced)
+                    mask = (symbols_pitch != 0)
+                    symbols_pitch[mask] += shift_val
+                    
+                    # Apply to frames_pitch (only voiced)
+                    mask = (frames_pitch != 0)
+                    frames_pitch[mask] += shift_val
+                
+                # Mel Shifting (Shift with Padding)
+                # mel_spec shape: (80, T)
+                # We shift along dim 0 (frequency)
+                # Use min_clipping value for padding (log domain)
+                min_val = np.log(self.hparams.min_clipping)
+                
+                if shift_bins > 0:
+                    # Shift UP: Pad bottom, Crop top
+                    # New[i] = Old[i - shift]
+                    # New[0..shift] = min_val
+                    shifted_mel = torch.roll(mel_spec, shift_bins, dims=0)
+                    shifted_mel[:shift_bins, :] = min_val
+                    mel_spec = shifted_mel
+                else:
+                    # Shift DOWN: Pad top, Crop bottom
+                    # New[i] = Old[i - shift] (shift is neg, so i + abs(shift))
+                    # New[end+shift..end] = min_val
+                    shifted_mel = torch.roll(mel_spec, shift_bins, dims=0)
+                    shifted_mel[shift_bins:, :] = min_val
+                    mel_spec = shifted_mel 
+
+        # 2. Energy Scale
+        if hasattr(self.hparams, 'energy_scale_min') and hasattr(self.hparams, 'energy_scale_max'):
+            scale = random.uniform(self.hparams.energy_scale_min, self.hparams.energy_scale_max)
+            # Energy is normalized. new_val = (val * scale - mean) / std ? 
+            # No, energy features are usually L2 norm or similar.
+            # If we scale signal by factor A, energy scales by A (or A^2 depending on def).
+            # Let's assume linear scaling of amplitude.
+            # Mel spec is log(magnitude). So log(A * mag) = log(A) + log(mag).
+            # So we add log(scale) to mel-spec.
+            
+            log_scale = np.log(scale)
+            mel_spec = mel_spec + log_scale
+            
+            # Update energy features.
+            # frames_energy is (energy - mean) / std.
+            # We need to know if 'energy' is log-energy or linear energy.
+            # Usually it's L2 norm of frame.
+            # If we scale audio by A, L2 norm scales by A.
+            # So we multiply the raw energy by A.
+            # new_norm = (raw * scale - mean) / std = (raw - mean + mean) * scale / std - mean/std
+            # = (norm * std + mean) * scale / std - mean/std
+            # = norm * scale + mean/std * (scale - 1)
+            
+            energy_mean = self.hparams.stats[f'spk {speaker_id}']['energy']['mean']
+            energy_std = self.hparams.stats[f'spk {speaker_id}']['energy']['std']
+            
+            if energy_std > 0:
+                # Apply to symbols_energy
+                mask = (symbols_energy != 0)
+                symbols_energy[mask] = symbols_energy[mask] * scale + (energy_mean / energy_std) * (scale - 1)
+                
+                # Apply to frames_energy
+                mask = (frames_energy != 0)
+                frames_energy[mask] = frames_energy[mask] * scale + (energy_mean / energy_std) * (scale - 1)
+
+        # 3. Time Stretch
+        if hasattr(self.hparams, 'time_stretch_min') and hasattr(self.hparams, 'time_stretch_max'):
+            stretch = random.uniform(self.hparams.time_stretch_min, self.hparams.time_stretch_max)
+            if stretch != 1.0:
+                # Stretch durations
+                durations_float = durations_float * stretch
+                
+                # Re-calculate int durations
+                # We need to ensure sum matches new mel-spec length
+                # New mel length = old * stretch
+                new_mel_len = int(mel_spec.size(1) * stretch)
+                
+                # Interpolate mel-spec
+                # mel_spec: (80, T) -> (1, 80, T)
+                mel_spec = F.interpolate(mel_spec.unsqueeze(0), size=new_mel_len, mode='linear', align_corners=False).squeeze(0)
+                
+                # Interpolate frames_energy and frames_pitch
+                # (T) -> (1, 1, T)
+                frames_energy = F.interpolate(frames_energy.unsqueeze(0).unsqueeze(0), size=new_mel_len, mode='linear', align_corners=False).squeeze(0).squeeze(0)
+                frames_pitch = F.interpolate(frames_pitch.unsqueeze(0).unsqueeze(0), size=new_mel_len, mode='linear', align_corners=False).squeeze(0).squeeze(0)
+                
+                # Adjust durations_int to match new_mel_len
+                # We can use the same logic as in model.py or simple rounding and fixing the diff
+                durations_int = torch.round(durations_float).long()
+                diff = new_mel_len - torch.sum(durations_int).item()
+                if diff != 0:
+                    # Add/subtract diff to the largest duration to minimize distortion
+                    argmax = torch.argmax(durations_int)
+                    durations_int[argmax] += diff
+                    # Ensure no negative/zero if possible (though argmax usually safe)
+                    if durations_int[argmax] < 1:
+                         durations_int[argmax] = 1
+                         # If we still have mismatch, just force resize mel? No, simpler to fix duration.
+                         # Re-check sum
+                         diff2 = new_mel_len - torch.sum(durations_int).item()
+                         if diff2 != 0:
+                             # Just trim/pad mel spec to match durations (easier)
+                             target_len = torch.sum(durations_int).item()
+                             if target_len > new_mel_len:
+                                 # Pad mel
+                                 pad_amt = target_len - new_mel_len
+                                 mel_spec = F.pad(mel_spec, (0, pad_amt))
+                                 frames_energy = F.pad(frames_energy, (0, pad_amt))
+                                 frames_pitch = F.pad(frames_pitch, (0, pad_amt))
+                             elif target_len < new_mel_len:
+                                 # Trim mel
+                                 mel_spec = mel_spec[:, :target_len]
+                                 frames_energy = frames_energy[:target_len]
+                                 frames_pitch = frames_pitch[:target_len]
+
+        return symbols, durations_float, durations_int, symbols_energy, symbols_pitch, \
+               frames_energy, frames_pitch, mel_spec
     
     def __getitem__(self, index):
         return self.get_data(self.data[index])

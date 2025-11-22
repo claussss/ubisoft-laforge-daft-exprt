@@ -72,6 +72,15 @@ class HyperParams(object):
         self.post_mult_weight = 1e-3  # weight to apply on FiLM scalar post-multipliers
         self.mel_spec_weight = 1.  # weight to apply on mel-spec loss
         
+        # accent conversion / augmentation hyper-parameters
+        self.use_concatenation = True  # Use concatenation instead of summation for prosody injection
+        self.aug_prob = 0.5  # Probability of applying augmentation
+        self.max_mel_shift = 3  # Max integer mel bins to shift (Bin-First Logic)
+        self.time_stretch_min = 0.8  # Min stretch factor
+        self.time_stretch_max = 1.2  # Max stretch factor
+        self.energy_scale_min = 0.7  # Min energy scale (tighter range)
+        self.energy_scale_max = 1.3  # Max energy scale (tighter range)
+        
         # optimization parameters
         self.optimizer = 'adam'  # 'adam', 'sgd'
         self.batch_size = 2

@@ -276,19 +276,23 @@ class GaussianUpsamplingModule(nn.Module):
         super(GaussianUpsamplingModule, self).__init__()
         embed_dim = hparams.phoneme_encoder['hidden_embed_dim']
         Tuple = namedtuple('Tuple', hparams.gaussian_upsampling_module)
-        hparams = Tuple(**hparams.gaussian_upsampling_module)
+        hparams_gum = Tuple(**hparams.gaussian_upsampling_module)
+        self.use_concatenation = getattr(hparams, 'use_concatenation', False)
         
         # duration, energy and pitch projection layers
-        self.duration_projection = ConvNorm1D(1, embed_dim, kernel_size=hparams.conv_kernel,
-                                              stride=1, padding=int((hparams.conv_kernel - 1) / 2),
+        self.duration_projection = ConvNorm1D(1, embed_dim, kernel_size=hparams_gum.conv_kernel,
+                                              stride=1, padding=int((hparams_gum.conv_kernel - 1) / 2),
                                               dilation=1, w_init_gain='linear')
-        self.energy_projection = ConvNorm1D(1, embed_dim, kernel_size=hparams.conv_kernel,
-                                            stride=1, padding=int((hparams.conv_kernel - 1) / 2),
+        self.energy_projection = ConvNorm1D(1, embed_dim, kernel_size=hparams_gum.conv_kernel,
+                                            stride=1, padding=int((hparams_gum.conv_kernel - 1) / 2),
                                             dilation=1, w_init_gain='linear')
-        self.pitch_projection = ConvNorm1D(1, embed_dim, kernel_size=hparams.conv_kernel,
-                                           stride=1, padding=int((hparams.conv_kernel - 1) / 2),
+        self.pitch_projection = ConvNorm1D(1, embed_dim, kernel_size=hparams_gum.conv_kernel,
+                                           stride=1, padding=int((hparams_gum.conv_kernel - 1) / 2),
                                            dilation=1, w_init_gain='linear')
         # ranges predictor
+        # If using concatenation, we need to project back to embed_dim for the range predictor
+        # or just use the summed version for range prediction (which is simpler and sufficient for duration modeling)
+        # We will use the summed version for range prediction to keep it consistent with duration modeling
         self.projection = nn.Sequential(
             LinearNorm(embed_dim, 1, w_init_gain='relu'),
             nn.Softplus()
@@ -314,12 +318,22 @@ class GaussianUpsamplingModule(nn.Module):
         pitch = self.pitch_projection(pitch)  # (B, L_max, hidden_embed_dim)
         
         # add energy and pitch to encoded input symbols
-        x = x + energies + pitch  # (B, L_max, hidden_embed_dim)
+        if self.use_concatenation:
+            # Concatenate: (B, L_max, 3 * hidden_embed_dim)
+            x_combined = torch.cat([x, energies, pitch], dim=2)
+            # For range prediction (duration modeling), we still use the summed version as a proxy
+            # or we could project x_combined back. Let's stick to the original logic for range prediction
+            # to avoid changing that part of the architecture too much.
+            x_summed = x + energies + pitch
+        else:
+            x = x + energies + pitch  # (B, L_max, hidden_embed_dim)
+            x_combined = x
+            x_summed = x
         
         # predict ranges for each symbol and mask tensor
         # use mask_value = 1. because ranges will be used as stds in Gaussian upsampling
         # mask_value = 0. would cause NaN values
-        range_inputs = x + durations  # (B, L_max, hidden_embed_dim) 
+        range_inputs = x_summed + durations  # (B, L_max, hidden_embed_dim) 
         ranges = self.projection(range_inputs)  # (B, L_max, 1)
         ranges = ranges.squeeze(2)  # (B, L_max)
         mask = ~get_mask_from_lengths(input_lengths) # (B, L_max)
@@ -345,7 +359,8 @@ class GaussianUpsamplingModule(nn.Module):
         # compute weights
         weights = probs / (torch.sum(probs, dim=1, keepdim=True) + 1e-20)  # (B, L_max, T_max)
         # compute upsampled embedding
-        x_upsamp = torch.sum(x.unsqueeze(-1) * weights.unsqueeze(2), dim=1)  # (B, input_dim, T_max)
+        # Use x_combined for upsampling
+        x_upsamp = torch.sum(x_combined.unsqueeze(-1) * weights.unsqueeze(2), dim=1)  # (B, input_dim, T_max)
         x_upsamp = x_upsamp.permute(0, 2, 1)  # (B, T_max, input_dim)
         
         return x_upsamp, weights
@@ -361,6 +376,16 @@ class FrameDecoder(nn.Module):
         super(FrameDecoder, self).__init__()
         nb_mels = hparams.n_mel_channels
         embed_dim = hparams.phoneme_encoder['hidden_embed_dim']
+        nb_mels = hparams.n_mel_channels
+        # Check if input_dim is provided in hparams (for concatenation support)
+        if hasattr(hparams, 'frame_decoder_input_dim'):
+            embed_dim = hparams.frame_decoder_input_dim
+        else:
+            embed_dim = hparams.phoneme_encoder['hidden_embed_dim']
+        
+        # "Highway" Architecture:
+        # We use the full input dimension (3 * hidden) as the internal dimension for the decoder.
+        # This means no projection at the input, and FFTBlocks operate on the larger dimension.
         hparams.frame_decoder['hidden_embed_dim'] = embed_dim
         Tuple = namedtuple('Tuple', hparams.frame_decoder)
         hparams = Tuple(**hparams.frame_decoder)
@@ -458,6 +483,13 @@ class DaftExprt(nn.Module):
         # Components
         self.phoneme_encoder = PhonemeEncoder(hparams)
         self.gaussian_upsampling = GaussianUpsamplingModule(hparams)
+        
+        # Configure Frame Decoder input dimension based on concatenation setting
+        if getattr(hparams, 'use_concatenation', False):
+            hparams.frame_decoder_input_dim = self.hidden_embed_dim * 3
+        else:
+            hparams.frame_decoder_input_dim = self.hidden_embed_dim
+            
         self.frame_decoder = FrameDecoder(hparams)
         
         # Speaker Embedding
@@ -468,28 +500,24 @@ class DaftExprt(nn.Module):
         # Frame Decoder needs FiLM params: nb_blocks * conv_channels * 2 (gamma, beta)
         # We use the same structure as ProsodyEncoder's projection but only for decoder
         decoder_nb_blocks = hparams.frame_decoder['nb_blocks']
-        decoder_conv_channels = hparams.phoneme_encoder['hidden_embed_dim'] # Based on FrameDecoder init
-        # Wait, FrameDecoder uses hidden_embed_dim for convs? 
-        # In FrameDecoder.__init__: hparams.frame_decoder['hidden_embed_dim'] = embed_dim
-        # And FFTBlock uses hparams.hidden_embed_dim.
-        # PositionWiseConvFF uses hparams.conv_channels.
-        # Let's check hparams structure or assume standard.
-        # In ProsodyEncoder, module_params['decoder'] = (hparams.frame_decoder['nb_blocks'], hparams.phoneme_encoder['hidden_embed_dim'])
-        # But PositionWiseConvFF uses hparams.conv_channels. 
-        # Let's look at FFTBlock -> PositionWiseConvFF.
-        # It seems 'conv_channels' in hparams.frame_decoder is what we need.
-        # I will assume hparams.frame_decoder has 'conv_channels'.
-        # If not, I'll use hidden_embed_dim as a fallback or check hparams.py later.
-        # Re-reading ProsodyEncoder: 
-        # 'decoder': (hparams.frame_decoder['nb_blocks'], hparams.phoneme_encoder['hidden_embed_dim'])
-        # This suggests the film params size depends on hidden_embed_dim?
-        # PositionWiseConvFF:
-        # outputs = gammas * outputs + betas
-        # outputs size is (B, L_max, hidden_embed_dim)
-        # So gammas/betas must be (B, 1, hidden_embed_dim).
-        # So nb_film_params per block = 2 * hidden_embed_dim.
         
-        nb_film_params_per_block = 2 * self.hidden_embed_dim
+        # Determine decoder hidden dim (Highway support)
+        if getattr(hparams, 'use_concatenation', False):
+            self.decoder_hidden_dim = self.hidden_embed_dim * 3
+        else:
+            self.decoder_hidden_dim = self.hidden_embed_dim
+            
+        # PositionWiseConvFF uses hparams.conv_channels.
+        # BUT, the FiLM modulation (gammas * outputs + betas) is applied to the output of the block,
+        # which has size (B, L_max, hidden_embed_dim).
+        # So nb_film_params per block = 2 * hidden_embed_dim.
+        # Wait, let's check PositionWiseConvFF.forward:
+        # outputs = gammas * outputs + betas
+        # outputs size is (B, L_max, hidden_embed_dim).
+        # So gammas/betas must be (B, 1, hidden_embed_dim).
+        # Yes. So we need 2 * decoder_hidden_dim per block.
+        
+        nb_film_params_per_block = 2 * self.decoder_hidden_dim
         self.nb_decoder_film_params = decoder_nb_blocks * nb_film_params_per_block
         
         self.gammas_predictor = LinearNorm(self.hidden_embed_dim, self.nb_decoder_film_params // 2, w_init_gain='linear')
@@ -547,7 +575,7 @@ class DaftExprt(nn.Module):
         betas = self.betas_predictor(spk_emb)   # (B, nb_decoder_film_params // 2)
         
         # Reshape for Decoder: (B, nb_blocks, nb_film_params_per_block)
-        # nb_film_params_per_block = 2 * hidden_embed_dim
+        # nb_film_params_per_block = 2 * decoder_hidden_dim
         # gammas/betas are currently flat for all blocks
         B = spk_emb.size(0)
         nb_blocks = self.frame_decoder.blocks.__len__() # Accessing ModuleList length
@@ -558,7 +586,7 @@ class DaftExprt(nn.Module):
         # Apply "delta regime" (gammas = 1 + delta) - standard in FiLM
         gammas = gammas + 1
         
-        film_params = torch.cat((gammas, betas), dim=2) # (B, nb_blocks, 2 * hidden_embed_dim)
+        film_params = torch.cat((gammas, betas), dim=2) # (B, nb_blocks, 2 * decoder_hidden_dim)
         
         # Decode
         mel_preds = self.frame_decoder(x, film_params, output_lengths) # (B, n_mel_channels, T_max)
@@ -716,7 +744,7 @@ class DaftExprt(nn.Module):
         # Apply "delta regime"
         gammas = gammas + 1
         
-        decoder_film = torch.cat((gammas, betas), dim=2) # (B, nb_blocks, 2 * hidden_embed_dim)
+        decoder_film = torch.cat((gammas, betas), dim=2) # (B, nb_blocks, 2 * decoder_hidden_dim)
         
         # Decode output sequence and predict mel-specs
         mel_spec_preds = self.frame_decoder(symbols_upsamp, decoder_film, output_lengths)  # (B, nb_mels, T_max)

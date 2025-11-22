@@ -293,7 +293,8 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
                              batch_speaker_ids, batch_file_names, output_dir, hparams,
                              n_jobs, use_griffin_lim=True, batch_external_prosody=None,
                              vocoder=None, source_stats=None, reduce_buzz=False,
-                             neutralize_prosody=False, neutralize_speaker_encoder=False):
+                             neutralize_prosody=False, neutralize_speaker_encoder=False,
+                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0):
     ''' Generate batch mel-specs using Daft-Exprt
     '''
     # add speaker info to file name
@@ -335,9 +336,21 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
         for idx, (entry, seq_len) in enumerate(zip(sorted_external_prosody, input_lengths.cpu().tolist())):
             assert len(entry['symbols']) == seq_len, \
                 _logger.error(f'External prosody length mismatch for sample {file_names[idx]}')
+            
             frames = torch.FloatTensor(entry['durations_frames'])
+            
+            # Apply variance exaggeration
+            # Formula: x' = mu + alpha * (x - mu)
+            # Duration
+            dur_mask = (frames > 0)
+            if dur_mask.any() and alpha_dur != 1.0:
+                dur_mean = frames[dur_mask].mean()
+                frames[dur_mask] = dur_mean + alpha_dur * (frames[dur_mask] - dur_mean)
+                frames = torch.clamp(frames, min=0.0) # Ensure no negative durations
+            
             ext_duration[idx, :seq_len] = frames * hop_in_seconds
-            ext_duration_int[idx, :seq_len] = torch.LongTensor(entry['durations_frames'])
+            ext_duration_int[idx, :seq_len] = torch.round(frames).long() # Re-calculate int frames from modified float frames
+
             energy_vals = torch.FloatTensor(entry['energy'])
             pitch_vals = torch.FloatTensor(entry['pitch'])
             energy_zero = (energy_vals == 0.)
@@ -359,6 +372,16 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
                 pitch_vals, pitch_zero,
                 {'mean': pitch_mean, 'std': pitch_std},
                 src_pitch_stats)
+            
+            # Apply variance exaggeration to Energy and Pitch (after normalization)
+            # Note: Since data is z-normalized (mean~0, std~1), mu is effectively 0.
+            # So the formula simplifies to x' = alpha * x
+            if alpha_energy != 1.0:
+                energy_vals[~energy_zero] *= alpha_energy
+            
+            if alpha_pitch != 1.0:
+                pitch_vals[~pitch_zero] *= alpha_pitch
+
             ext_energy[idx, :seq_len] = energy_vals
             ext_pitch[idx, :seq_len] = pitch_vals
         external_tensors = {
@@ -435,7 +458,8 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
                        dur_factors=None, energy_factors=None, pitch_factors=None, batch_size=1,
                        n_jobs=1, use_griffin_lim=False, get_time_perf=False, external_prosody=None,
                        vocoder=None, source_stats=None, reduce_buzz=False,
-                       neutralize_prosody=False, neutralize_speaker_encoder=False):
+                       neutralize_prosody=False, neutralize_speaker_encoder=False,
+                       alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0):
     ''' Generate mel-specs using Daft-Exprt
 
         sentences = [
@@ -550,7 +574,8 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
                                                               n_jobs, use_griffin_lim, batch_external, vocoder,
                                                               source_stats=source_stats, reduce_buzz=reduce_buzz,
                                                               neutralize_prosody=neutralize_prosody,
-                                                              neutralize_speaker_encoder=neutralize_speaker_encoder)
+                                                              neutralize_speaker_encoder=neutralize_speaker_encoder,
+                                                              alpha_dur=alpha_dur, alpha_pitch=alpha_pitch, alpha_energy=alpha_energy)
             predictions.update(batch_predictions)
             time_per_batch += [time.time() - sentence_begin] if get_time_perf else []
     
@@ -592,6 +617,15 @@ def extract_reference_parameters(audio_ref, output_dir, hparams, ref_name=None):
         # get energy
         energy = extract_energy(np.exp(mel_spec))
         # check sizes are correct
+        # Fix potential 1-frame mismatch between pitch/energy and mel-spec
+        min_len = min(len(pitch), len(energy), mel_spec.shape[1])
+        if len(pitch) > min_len:
+            pitch = pitch[:min_len]
+        if len(energy) > min_len:
+            energy = energy[:min_len]
+        if mel_spec.shape[1] > min_len:
+            mel_spec = mel_spec[:, :min_len]
+            
         assert(len(pitch) == mel_spec.shape[1]), f'{len(pitch)} -- {mel_spec.shape[1]}'
         assert(len(energy) == mel_spec.shape[1]), f'{len(energy)} -- {mel_spec.shape[1]}'
         # save references to .npz file

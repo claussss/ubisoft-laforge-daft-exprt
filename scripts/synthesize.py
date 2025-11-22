@@ -250,7 +250,8 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
                        n_jobs, use_griffin_lim, get_time_perf, external_prosody, vocoder,
                        source_stats=source_stats, reduce_buzz=args.reduce_buzz,
                        neutralize_prosody=args.neutralize_prosody,
-                       neutralize_speaker_encoder=args.neutralize_speaker_encoder)
+                       neutralize_speaker_encoder=args.neutralize_speaker_encoder,
+                       alpha_dur=args.alpha_dur, alpha_pitch=args.alpha_pitch, alpha_energy=args.alpha_energy)
     compare_paths = None
     if args.plot_prosody_files_to_compare:
         compare_paths = _load_manifest(os.path.abspath(args.plot_prosody_files_to_compare), len(sentences), split_text=True)
@@ -465,6 +466,12 @@ if __name__ == '__main__':
                         help='Neutralize the reference audio embedding (zero it out).')
     parser.add_argument('--neutralize_speaker_encoder', action='store_true',
                         help='Neutralize the speaker embedding for the phoneme encoder only.')
+    parser.add_argument('--alpha_dur', type=float, default=1.0,
+                        help='Duration exaggeration factor (variance scaling). Default 1.0 (no change).')
+    parser.add_argument('--alpha_pitch', type=float, default=1.0,
+                        help='Pitch exaggeration factor (variance scaling). Default 1.0 (no change).')
+    parser.add_argument('--alpha_energy', type=float, default=1.0,
+                        help='Energy exaggeration factor (variance scaling). Default 1.0 (no change).')
     
     args = parser.parse_args()
     
