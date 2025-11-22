@@ -195,6 +195,16 @@ if __name__ == '__main__':
         'language': args.language,
         'speakers': args.speakers
     }
+
+    # load existing config if it exists to preserve user changes (e.g. batch_size)
+    if os.path.isfile(config_file):
+        with open(config_file, 'r') as f:
+            saved_config = json.load(f)
+        # update hparams_kwargs with saved config, but let current paths override
+        for key, value in saved_config.items():
+            if key not in hparams_kwargs:
+                hparams_kwargs[key] = value
+
     # fill hparams dictionary to overwrite default hyper-param values
     hparams_kwargs['checkpoint'] = args.checkpoint if hasattr(args, 'checkpoint') else ''
     hparams_kwargs['device'] = 'cpu' if hasattr(args, 'cpu') and args.cpu else 'cuda'
