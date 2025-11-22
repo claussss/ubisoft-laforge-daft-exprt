@@ -20,15 +20,15 @@ class DaftExprtLoss(nn.Module):
         :param iteration:       current training iteration
         '''
         # extract ground-truth targets
-        # targets are already zero padded
-        # targets = (mel_specs, output_lengths)
-        mel_spec_targets, output_lengths = targets
+        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths)
+        _, _, _, mel_spec_targets, output_lengths = targets
         mel_spec_targets.requires_grad = False
         
         # extract predictions
-        # predictions are already zero padded
-        # outputs = (mel_preds, weights)
-        mel_spec_preds, _ = outputs
+        # outputs = (None, None, encoder_preds, decoder_preds, weights)
+        # decoder_preds = (mel_preds, output_lengths)
+        _, _, _, decoder_preds, _ = outputs
+        mel_spec_preds, _ = decoder_preds
         
         # We need output_lengths to normalize loss
         # It's not in targets tuple passed from train.py?
