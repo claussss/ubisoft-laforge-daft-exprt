@@ -22,3 +22,7 @@ src/daft_exprt/vocoder/generator_v1_lj
 daft_exprt_pack.tar.gz
 scripts/style_bank/english/
 DaftExprt_65000.pt
+train.slurm
+core
+logs/
+reaper_source/
