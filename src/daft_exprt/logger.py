@@ -99,31 +99,31 @@ class DaftExprtLogger(SummaryWriter):
         
         # extract all FiLM parameter predictions on the validation set
         # FiLM parameters for Encoder Module
-        encoder_film = [output[1][1] for output in val_outputs]  # (B, nb_blocks, nb_film_params)
-        encoder_film = torch.cat(encoder_film, dim=0)  # (B_tot, nb_blocks, nb_film_params)
-        encoder_film = encoder_film.detach().cpu().numpy()  # (B_tot, nb_blocks, nb_film_params)
-        # FiLM parameters for Prosody Predictor Module
-        prosody_pred_film = [output[1][2] for output in val_outputs] # (B, nb_blocks, nb_film_params)
-        prosody_pred_film = torch.cat(prosody_pred_film, dim=0)  # (B_tot, nb_blocks, nb_film_params)
-        prosody_pred_film = prosody_pred_film.detach().cpu().numpy()  # (B_tot, nb_blocks, nb_film_params)
-        # FiLM parameters for Decoder Module
-        decoder_film = [output[1][3] for output in val_outputs] # (B, nb_blocks, nb_film_params)
-        decoder_film = torch.cat(decoder_film, dim=0)  # (B_tot, nb_blocks, nb_film_params)
-        decoder_film = decoder_film.detach().cpu().numpy()  # (B_tot, nb_blocks, nb_film_params)
+        # encoder_film = [output[1][1] for output in val_outputs]  # (B, nb_blocks, nb_film_params)
+        # encoder_film = torch.cat(encoder_film, dim=0)  # (B_tot, nb_blocks, nb_film_params)
+        # encoder_film = encoder_film.detach().cpu().numpy()  # (B_tot, nb_blocks, nb_film_params)
+        # # FiLM parameters for Prosody Predictor Module
+        # prosody_pred_film = [output[1][2] for output in val_outputs] # (B, nb_blocks, nb_film_params)
+        # prosody_pred_film = torch.cat(prosody_pred_film, dim=0)  # (B_tot, nb_blocks, nb_film_params)
+        # prosody_pred_film = prosody_pred_film.detach().cpu().numpy()  # (B_tot, nb_blocks, nb_film_params)
+        # # FiLM parameters for Decoder Module
+        # decoder_film = [output[1][3] for output in val_outputs] # (B, nb_blocks, nb_film_params)
+        # decoder_film = torch.cat(decoder_film, dim=0)  # (B_tot, nb_blocks, nb_film_params)
+        # decoder_film = decoder_film.detach().cpu().numpy()  # (B_tot, nb_blocks, nb_film_params)
         
-        # plot histograms of gammas and betas for each block of each module
-        for module, tensor in zip(['encoder', 'prosody_predictor', 'decoder'],
-                                  [encoder_film, prosody_pred_film, decoder_film]):
-            nb_blocks = tensor.shape[1]
-            nb_gammas = int(tensor.shape[2] / 2)
-            gammas = histogram_plot(data=[tensor[:, i, :nb_gammas] for i in range(nb_blocks)],
-                                    x_labels=[f'Value -- Block {i}' for i in range(nb_blocks)],
-                                    y_labels=['Frequency' for _ in range(nb_blocks)])
-            self.add_figure(tag=f'{module} -- FiLM gammas', figure=gammas, global_step=iteration)
-            betas = histogram_plot(data=[tensor[:, i, nb_gammas:] for i in range(nb_blocks)],
-                                   x_labels=[f'Value -- Block {i}' for i in range(nb_blocks)],
-                                   y_labels=['Frequency' for _ in range(nb_blocks)])
-            self.add_figure(tag=f'{module} -- FiLM betas', figure=betas, global_step=iteration)
+        # # plot histograms of gammas and betas for each block of each module
+        # for module, tensor in zip(['encoder', 'prosody_predictor', 'decoder'],
+        #                           [encoder_film, prosody_pred_film, decoder_film]):
+        #     nb_blocks = tensor.shape[1]
+        #     nb_gammas = int(tensor.shape[2] / 2)
+        #     gammas = histogram_plot(data=[tensor[:, i, :nb_gammas] for i in range(nb_blocks)],
+        #                             x_labels=[f'Value -- Block {i}' for i in range(nb_blocks)],
+        #                             y_labels=['Frequency' for _ in range(nb_blocks)])
+        #     self.add_figure(tag=f'{module} -- FiLM gammas', figure=gammas, global_step=iteration)
+        #     betas = histogram_plot(data=[tensor[:, i, nb_gammas:] for i in range(nb_blocks)],
+        #                            x_labels=[f'Value -- Block {i}' for i in range(nb_blocks)],
+        #                            y_labels=['Frequency' for _ in range(nb_blocks)])
+        #     self.add_figure(tag=f'{module} -- FiLM betas', figure=betas, global_step=iteration)
         # plot duration target and duration pred
         durations = scatter_plot(data=(duration_targets, duration_preds),
                                  colors=('blue', 'red'),

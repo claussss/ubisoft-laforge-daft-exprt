@@ -519,7 +519,7 @@ class DaftExprt(nn.Module):
         # create inputs and targets
         inputs = (symbols, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths,
                   frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids)
-        targets = (mel_specs, output_lengths)
+        targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths)
         
         return inputs, targets
     
@@ -563,7 +563,7 @@ class DaftExprt(nn.Module):
         # Decode
         mel_preds = self.frame_decoder(x, film_params, output_lengths) # (B, n_mel_channels, T_max)
         
-        return mel_preds, weights
+        return None, None, (durations_float, symbols_energy, symbols_pitch, input_lengths), (mel_preds, output_lengths), weights
     def get_int_durations(self, duration_preds, hparams):
         ''' Convert float durations to integer frame durations
         '''
