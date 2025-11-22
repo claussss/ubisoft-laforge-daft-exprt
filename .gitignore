@@ -19,3 +19,4 @@ outputs/
 DaftExprt_LJ_ESD_22kHz.pt
 src/daft_exprt/vocoder/g_02500000_v1_uni
 src/daft_exprt/vocoder/generator_v1_lj
+daft_exprt_pack.tar.gz

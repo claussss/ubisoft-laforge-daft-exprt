@@ -30,7 +30,7 @@ def list_all_speakers(data_set_dir):
     speakers = []
     data_set_dir = os.path.normpath(data_set_dir)
     # walk into data_set_dir
-    for root, directories, files in os.walk(data_set_dir):
+    for root, directories, files in os.walk(data_set_dir, followlinks=True):
         if 'wavs' in directories and 'metadata.csv' in files:
             # extract speaker data set relative path
             spk_relative_path = os.path.relpath(root, data_set_dir)
