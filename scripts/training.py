@@ -201,8 +201,9 @@ if __name__ == '__main__':
         with open(config_file, 'r') as f:
             saved_config = json.load(f)
         # update hparams_kwargs with saved config, but let current paths override
+        # AND exclude 'stats' to force reloading from stats.json (which might be newer)
         for key, value in saved_config.items():
-            if key not in hparams_kwargs:
+            if key not in hparams_kwargs and key != 'stats':
                 hparams_kwargs[key] = value
 
     # fill hparams dictionary to overwrite default hyper-param values
