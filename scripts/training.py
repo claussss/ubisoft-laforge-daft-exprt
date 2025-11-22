@@ -16,7 +16,6 @@ from daft_exprt.create_sets import create_sets
 from daft_exprt.extract_features import check_features_config_used, extract_features
 from daft_exprt.features_stats import extract_features_stats
 from daft_exprt.hparams import HyperParams
-from daft_exprt.mfa import mfa
 from daft_exprt.utils import get_nb_jobs
 
 
@@ -43,6 +42,8 @@ def list_all_speakers(data_set_dir):
 def pre_process(pre_process_args):
     ''' Pre-process speakers data sets for training
     '''
+    from daft_exprt.mfa import mfa
+    
     # check experiment folder is new
     checkpoint_dir = os.path.join(output_directory, 'checkpoints')
     if os.path.isdir(checkpoint_dir):
