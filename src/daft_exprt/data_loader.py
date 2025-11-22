@@ -121,10 +121,29 @@ class DaftExprtDataLoader(Dataset):
         frames_pitch = self.get_pitch(frames_pitch, speaker_id, normalize=False)
         
         # check everything is correct with sizes
+        if len(symbols_energy) != len(symbols):
+            print(f"ERROR: Energy/Symbols mismatch in {features_dir}/{feature_file}")
+            print(f"Energy len: {len(symbols_energy)}, Symbols len: {len(symbols)}")
         assert(len(symbols_energy) == len(symbols))
+        
+        if len(symbols_pitch) != len(symbols):
+            print(f"ERROR: Pitch/Symbols mismatch in {features_dir}/{feature_file}")
+            print(f"Pitch len: {len(symbols_pitch)}, Symbols len: {len(symbols)}")
         assert(len(symbols_pitch) == len(symbols))
+        
+        if len(frames_energy) != mel_spec.size(1):
+            print(f"ERROR: Frames Energy/Mel mismatch in {features_dir}/{feature_file}")
+            print(f"Frames Energy len: {len(frames_energy)}, Mel len: {mel_spec.size(1)}")
         assert(len(frames_energy) == mel_spec.size(1))
+        
+        if len(frames_pitch) != mel_spec.size(1):
+            print(f"ERROR: Frames Pitch/Mel mismatch in {features_dir}/{feature_file}")
+            print(f"Frames Pitch len: {len(frames_pitch)}, Mel len: {mel_spec.size(1)}")
         assert(len(frames_pitch) == mel_spec.size(1))
+        
+        if torch.sum(durations_int) != mel_spec.size(1):
+            print(f"ERROR: Duration/Mel mismatch in {features_dir}/{feature_file}")
+            print(f"Duration sum: {torch.sum(durations_int)}, Mel len: {mel_spec.size(1)}")
         assert(torch.sum(durations_int) == mel_spec.size(1))
         
         return symbols, durations_float, durations_int, symbols_energy, symbols_pitch, \
