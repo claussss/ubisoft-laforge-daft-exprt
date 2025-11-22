@@ -61,7 +61,8 @@ class DaftExprtLoss(nn.Module):
         # But standard pytorch training loops usually pass outputs, targets.
         
         # Let's assume targets = (mel_specs, output_lengths).
-        mel_spec_targets, output_lengths = targets
+        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths)
+        _, _, _, mel_spec_targets, output_lengths = targets
         mel_spec_targets.requires_grad = False
         output_lengths.requires_grad = False
         
