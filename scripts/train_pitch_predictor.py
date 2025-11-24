@@ -141,7 +141,7 @@ def train(args):
     _logger.info(f"Starting training on device: {device}")
     
     model.train()
-    for epoch in range(args.epochs):
+    for epoch in range(args.start_epoch, args.start_epoch + args.epochs):
         total_loss = 0
         for i, batch in enumerate(train_loader):
             # Parse batch
@@ -191,6 +191,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--save_interval', type=int, default=10)
+    parser.add_argument('--start_epoch', type=int, default=0, help='Epoch to start counting from (useful for resuming)')
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--cpu', action='store_true')
     args = parser.parse_args()
