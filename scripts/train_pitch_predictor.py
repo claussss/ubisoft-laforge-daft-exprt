@@ -35,10 +35,26 @@ def train(args):
         with open(train_list_path, 'w') as f:
             for root, dirs, files in os.walk(args.data_set_dir):
                 for file in files:
-                    if file.endswith('.npy') and 'mel_spec' in file:
-                        # We need the base path (without _mel_spec.npy)
-                        base_path = os.path.join(root, file.replace('-mel_spec.npy', ''))
-                        f.write(f"{base_path}\n")
+                    if file.endswith('.npy') and not file.endswith('mel_spec.npy'): 
+                        # Assuming standard format: SpeakerID/SpeakerID_FileID.npy
+                        # e.g. .../0011/0011_000001.npy
+                        
+                        # We need to write: features_dir|feature_file|speaker_id
+                        features_dir = root
+                        feature_file = os.path.splitext(file)[0]
+                        
+                        # Try to extract speaker ID from directory name or filename
+                        # Directory name is usually the speaker ID (e.g. 0011)
+                        try:
+                            speaker_id = int(os.path.basename(root))
+                        except ValueError:
+                            # Fallback: try first part of filename
+                            try:
+                                speaker_id = int(feature_file.split('_')[0])
+                            except ValueError:
+                                speaker_id = 0 # Default if unknown
+                        
+                        f.write(f"{features_dir}|{feature_file}|{speaker_id}\n")
         
         _logger.info(f"Generated training list at {train_list_path}")
         
