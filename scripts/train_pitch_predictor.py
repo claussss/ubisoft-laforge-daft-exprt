@@ -119,6 +119,16 @@ def train(args):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     
+    # Load checkpoint if provided
+    if args.checkpoint:
+        if os.path.isfile(args.checkpoint):
+            _logger.info(f"Loading checkpoint from {args.checkpoint}")
+            state_dict = torch.load(args.checkpoint, map_location=device)
+            model.load_state_dict(state_dict)
+        else:
+            _logger.error(f"Checkpoint file not found: {args.checkpoint}")
+            sys.exit(1)
+    
     _logger.info(f"Training files path: {hparams.training_files}")
     if not os.path.isfile(hparams.training_files):
         _logger.error(f"Training file does not exist: {hparams.training_files}")
@@ -181,6 +191,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--save_interval', type=int, default=10)
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--cpu', action='store_true')
     args = parser.parse_args()
     
