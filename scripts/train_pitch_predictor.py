@@ -87,7 +87,7 @@ def train(args):
     
     # Data Loader
     # If training_files is not set in hparams (e.g. no config file), we need it.
-    if not hparams.training_files:
+    if not hparams.training_files or hparams.training_files == 'dummy_train.txt':
         if args.data_set_dir:
              # Try to find train.txt in output_dir (if we ran pre-process there) or just list files?
              # Simplest: Just list all .npy files in data_set_dir recursively?
