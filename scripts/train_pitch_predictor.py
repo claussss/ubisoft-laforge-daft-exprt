@@ -67,6 +67,19 @@ def train(args):
             'speakers': ['default'] # Placeholder speakers list
         }
         hparams = HyperParams(verbose=False, **kwargs)
+        
+        # Load stats.json if available in data_set_dir or parent
+        stats_path = os.path.join(args.data_set_dir, 'stats.json')
+        if not os.path.isfile(stats_path):
+            # Try parent directory
+            stats_path = os.path.join(os.path.dirname(args.data_set_dir.rstrip('/')), 'stats.json')
+            
+        if os.path.isfile(stats_path):
+            _logger.info(f"Loading stats from {stats_path}")
+            with open(stats_path, 'r') as f:
+                hparams.stats = json.load(f)
+        else:
+            _logger.warning(f"Could not find stats.json in {args.data_set_dir} or parent. Normalization might fail.")
     else:
         raise ValueError("Must provide --config_file or --data_set_dir")
 
