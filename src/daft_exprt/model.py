@@ -9,6 +9,14 @@ from torch.distributions import Normal
 from torch.nn.parameter import Parameter
 
 from daft_exprt.extract_features import duration_to_integer
+from daft_exprt.layers import (
+    ConvNorm1D,
+    LinearNorm,
+    PositionalEncoding,
+    MultiHeadAttention,
+    PositionwiseFeedForward,
+    ProsodyAdversary
+)
 
 
 def get_mask_from_lengths(lengths):
@@ -490,6 +498,11 @@ class DaftExprt(nn.Module):
         else:
             hparams.frame_decoder_input_dim = self.hidden_embed_dim
             
+        # prosody adversary
+        self.adversary = None
+        if getattr(hparams, 'adversarial_weight', 0) > 0:
+            self.adversary = ProsodyAdversary(hparams.phoneme_encoder['hidden_embed_dim'])
+
         self.frame_decoder = FrameDecoder(hparams)
         
         # Speaker Embedding
@@ -547,7 +560,7 @@ class DaftExprt(nn.Module):
         # create inputs and targets
         inputs = (symbols, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths,
                   frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids)
-        targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths)
+        targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch)
         
         return inputs, targets
     
@@ -561,6 +574,7 @@ class DaftExprt(nn.Module):
         # 1. Encode Phonemes (No speaker conditioning)
         # Pass None for film_params
         x = self.phoneme_encoder(symbols, None, input_lengths) # (B, L_max, hidden_embed_dim)
+        encoder_outputs = x
         
         # 2. Gaussian Upsampling (using ground truth prosody)
         # We use the ground truth durations, energy, pitch provided in inputs
@@ -591,7 +605,14 @@ class DaftExprt(nn.Module):
         # Decode
         mel_preds = self.frame_decoder(x, film_params, output_lengths) # (B, n_mel_channels, T_max)
         
-        return None, None, (durations_float, symbols_energy, symbols_pitch, input_lengths), (mel_preds, output_lengths), weights
+        # Adversarial Disentanglement
+        adversary_preds = None
+        if self.adversary is not None:
+            adversary_preds = self.adversary(encoder_outputs, alpha=1.0)
+
+        # Return flat tuple matching loss.py expectation:
+        # (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds)
+        return mel_preds, durations_float, symbols_pitch, symbols_energy, None, None, input_lengths, output_lengths, weights, adversary_preds
     def get_int_durations(self, duration_preds, hparams):
         ''' Convert float durations to integer frame durations
         '''

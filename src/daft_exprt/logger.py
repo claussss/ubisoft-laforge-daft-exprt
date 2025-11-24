@@ -57,11 +57,20 @@ class DaftExprtLogger(SummaryWriter):
         targets = val_targets[idx]
         outputs = val_outputs[idx]
         # extract predicted outputs and ground-truth values
-        duration_targets, energy_targets, pitch_targets, mel_spec_targets, _ = targets
-        _, _, encoder_preds, decoder_preds, alignments = outputs
-        duration_preds, energy_preds, pitch_preds, input_lengths = encoder_preds
-        mel_spec_preds, output_lengths = decoder_preds
-        weights = alignments
+        # extract predicted outputs and ground-truth values
+        duration_targets, energy_targets, pitch_targets, mel_spec_targets, _, _ = targets
+        
+        # New flat tuple structure:
+        # (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds)
+        mel_spec_preds = outputs[0]
+        duration_preds = outputs[1]
+        pitch_preds = outputs[2]
+        energy_preds = outputs[3]
+        input_lengths = outputs[6]
+        output_lengths = outputs[7]
+        weights = outputs[8]
+        
+        # choose random index in the batch
         # choose random index in the batch
         idx = random.randint(0, mel_spec_preds.size(0) - 1)
         # extract corresponding sequence length

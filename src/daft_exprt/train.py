@@ -206,7 +206,9 @@ def validate(gpu, model, criterion, val_loader, hparams):
     # initialize variables
     val_loss = 0.
     val_indiv_loss = {
-        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
+        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
+        'adv_loss': 0., 'energy_consistency_loss': 0.,
+        'pitch_consistency_loss': 0.
     }
     val_targets, val_outputs = [], []
     
@@ -348,7 +350,9 @@ def train(gpu, hparams, log_file):
     # set variables
     tot_loss = 0.
     indiv_loss = {
-        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
+        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
+        'adv_loss': 0., 'energy_consistency_loss': 0.,
+        'pitch_consistency_loss': 0.
     }
     total_time = 0.
     start = time.time()
@@ -478,9 +482,9 @@ def train(gpu, hparams, log_file):
                 iteration += 1
                 tot_loss = 0.
                 indiv_loss = {
-                    'speaker_loss': 0., 'post_mult_loss': 0.,
-                    'duration_loss': 0., 'energy_loss':0., 'pitch_loss': 0.,
-                    'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
+                    'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
+                    'adv_loss': 0., 'energy_consistency_loss': 0.,
+                    'pitch_consistency_loss': 0.
                 }
                 start = time.time()
                 accumulation_step = 0

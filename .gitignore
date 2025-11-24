@@ -7,6 +7,8 @@ build/
 
 #################### Daft-Exprt #####################
 datasets
+!trainings/daft_exprt_tiny_aug/config.json
+!trainings/daft_exprt_tiny_aug/config_adv.json
 trainings/
 tmp/
 tmp_symbol_prosody/
@@ -26,3 +28,6 @@ train.slurm
 core
 logs/
 reaper_source/
+config.json
+config_adv.json
+DaftExprt_70000_augm.pt

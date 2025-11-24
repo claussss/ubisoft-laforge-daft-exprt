@@ -102,9 +102,20 @@ def pre_process(pre_process_args):
 def train(train_args):
     ''' Train Daft-Exprt on the pre-processed data sets
     '''
+    # check config
+    # check_train_config(hparams)
+    
+    import sys
+    print(f"DEBUG: sys.executable: {sys.executable}")
+    try:
+        import matplotlib
+        print(f"DEBUG: matplotlib file: {matplotlib.__file__}")
+    except ImportError as e:
+        print(f"DEBUG: Could not import matplotlib: {e}")
+
     # launch training in distributed mode or not
     training_script = os.path.join(PROJECT_ROOT, 'src', 'daft_exprt', 'train.py')
-    process = ['python', f'{training_script}',
+    process = [sys.executable, f'{training_script}',
                '--data_set_dir', f'{data_set_dir}',
                '--config_file', f'{config_file}',
                '--benchmark_dir', f'{benchmark_dir}',
@@ -142,6 +153,8 @@ if __name__ == '__main__':
                              'If [], finds all speakers contained in data_set_dir')
     parser.add_argument('-lg', '--language', type=str, default='english',
                         help='spoken language of the speakers that are stored in data_set_dir')
+    parser.add_argument('-cfg', '--config_file', type=str, default='',
+                        help='optional path to a config file to use (overrides default location)')
     
     parser_pre_process = subparsers.add_parser('pre_process', help='pre-process speakers data sets for training')
     parser_pre_process.set_defaults(func=pre_process)
@@ -180,7 +193,7 @@ if __name__ == '__main__':
     output_directory = os.path.join(PROJECT_ROOT, 'trainings', args.experiment_name)
     training_files = os.path.join(output_directory, f'train_{args.language}.txt')
     validation_files = os.path.join(output_directory, f'validation_{args.language}.txt')
-    config_file = os.path.join(output_directory, 'config.json')
+    config_file = os.path.abspath(args.config_file) if args.config_file else os.path.join(output_directory, 'config.json')
     stats_file = os.path.join(output_directory, 'stats.json')
     benchmark_dir = os.path.join(PROJECT_ROOT, 'scripts', 'benchmarks')
     

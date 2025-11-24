@@ -74,12 +74,18 @@ class HyperParams(object):
         
         # accent conversion / augmentation hyper-parameters
         self.use_concatenation = True  # Use concatenation instead of summation for prosody injection
-        self.aug_prob = 0.5  # Probability of applying augmentation
+        self.aug_prob = 0.0  # Probability of applying augmentation
         self.max_mel_shift = 3  # Max integer mel bins to shift (Bin-First Logic)
         self.time_stretch_min = 0.8  # Min stretch factor
         self.time_stretch_max = 1.2  # Max stretch factor
         self.energy_scale_min = 0.7  # Min energy scale (tighter range)
         self.energy_scale_max = 1.3  # Max energy scale (tighter range)
+        
+        # Advanced Disentanglement
+        self.adversarial_weight = 0.2
+        self.energy_consistency_weight = 0.05
+        self.pitch_consistency_weight = 0.15
+        self.pitch_predictor_path = "/home/yurii/Projects/LLM_AC/ubisoft-laforge-daft-exprt/trainings/pitch_predictor_test/pitch_predictor_epoch_5.pt"
         
         # optimization parameters
         self.optimizer = 'adam'  # 'adam', 'sgd'
