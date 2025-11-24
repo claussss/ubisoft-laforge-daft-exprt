@@ -69,15 +69,37 @@ def train(args):
         hparams = HyperParams(verbose=False, **kwargs)
         
         # Load stats.json if available in data_set_dir or parent
-        stats_path = os.path.join(args.data_set_dir, 'stats.json')
-        if not os.path.isfile(stats_path):
-            # Try parent directory
-            stats_path = os.path.join(os.path.dirname(args.data_set_dir.rstrip('/')), 'stats.json')
+        if args.stats_file:
+            stats_path = args.stats_file
+        else:
+            stats_path = os.path.join(args.data_set_dir, 'stats.json')
+            if not os.path.isfile(stats_path):
+                # Try parent directory
+                stats_path = os.path.join(os.path.dirname(args.data_set_dir.rstrip('/')), 'stats.json')
             
         if os.path.isfile(stats_path):
             _logger.info(f"Loading stats from {stats_path}")
             with open(stats_path, 'r') as f:
                 hparams.stats = json.load(f)
+                
+            # Patch stats for missing speakers to prevent KeyError in DataLoader
+            # PitchPredictor doesn't use normalized symbols/energy, so dummy stats are fine.
+            # We need to scan the training list to find all speakers.
+            speakers_found = set()
+            with open(train_list_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('|')
+                    if len(parts) >= 3:
+                        speakers_found.add(int(parts[2]))
+            
+            for spk_id in speakers_found:
+                spk_key = f'spk {spk_id}'
+                if spk_key not in hparams.stats:
+                    _logger.warning(f"Speaker {spk_key} missing from stats. Using dummy stats.")
+                    hparams.stats[spk_key] = {
+                        'energy': {'mean': 0.0, 'std': 1.0},
+                        'pitch': {'mean': 0.0, 'std': 1.0}
+                    }
         else:
             _logger.warning(f"Could not find stats.json in {args.data_set_dir} or parent. Normalization might fail.")
     else:
@@ -153,6 +175,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_file', type=str, default=None, help='Path to config.json')
     parser.add_argument('--data_set_dir', type=str, default=None, help='Path to dataset directory (features)')
+    parser.add_argument('--stats_file', type=str, default=None, help='Path to stats.json')
     parser.add_argument('--output_dir', type=str, required=True, help='Directory to save checkpoints')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=None)
