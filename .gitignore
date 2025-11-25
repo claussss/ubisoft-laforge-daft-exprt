@@ -31,3 +31,4 @@ reaper_source/
 config.json
 config_adv.json
 DaftExprt_70000_augm.pt
+train_pitch_predictor.slurm
