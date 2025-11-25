@@ -114,12 +114,16 @@ class DaftExprtDataLoader(Dataset):
         frames_pitch = os.path.join(features_dir, f'{feature_file}.frames_f0')
         
         # extract data
-        mel_spec = self.get_mel_spec(mel_spec)
-        symbols, durations_float, durations_int = self.get_symbols_and_durations(markers)
-        symbols_energy = self.get_energies(symbols_energy, speaker_id)
-        frames_energy = self.get_energies(frames_energy, speaker_id, normalize=False)
-        symbols_pitch = self.get_pitch(symbols_pitch, speaker_id)
-        frames_pitch = self.get_pitch(frames_pitch, speaker_id, normalize=False)
+        try:
+            mel_spec = self.get_mel_spec(mel_spec)
+            symbols, durations_float, durations_int = self.get_symbols_and_durations(markers)
+            symbols_energy = self.get_energies(symbols_energy, speaker_id)
+            frames_energy = self.get_energies(frames_energy, speaker_id, normalize=False)
+            symbols_pitch = self.get_pitch(symbols_pitch, speaker_id)
+            frames_pitch = self.get_pitch(frames_pitch, speaker_id, normalize=False)
+        except Exception as e:
+            print(f"ERROR: Exception loading data in {features_dir}/{feature_file}: {e}")
+            return None
         
         # check everything is correct with sizes
         try:
