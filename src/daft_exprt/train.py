@@ -394,6 +394,7 @@ def train(gpu, hparams, log_file):
             if use_external_embeddings:
                 if stats_manager is None:
                      _logger.info("Initializing Dynamic Speaker Stats Manager (Lazy)...")
+                     _logger.info(">> DYNAMIC STATS ENABLED: Overriding static 'stats.json'. Data loader returns raw values; Normalization happens on-the-fly using random subsets.")
                      stats_manager = DynamicSpeakerStatsManager(hparams)
 
                 if stats_manager is not None:
