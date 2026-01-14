@@ -58,10 +58,12 @@ class DynamicSpeakerStatsManager:
         
         for speaker_id, files in self.file_list_by_speaker.items():
             # Select subset
-            if len(files) > self.subset_size:
-                subset = random.sample(files, self.subset_size)
-            else:
-                subset = files
+            # Select subset
+            # Randomize size between 1 and min(len(files), self.subset_size)
+            # This simulates variable reference data availability.
+            max_k = min(len(files), self.subset_size)
+            current_k = random.randint(1, max_k)
+            subset = random.sample(files, current_k)
                 
             # Accumulate values
             all_pitch = []
