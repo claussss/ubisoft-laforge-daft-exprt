@@ -347,6 +347,27 @@ def train(gpu, hparams, log_file):
     _logger.info(f"Nb iterations per epoch: {nb_iterations_per_epoch:_}")
     _logger.info(f"Nb total of epochs: {epochs:_}")
     _logger.info(f"Started at epoch: {epoch_offset:_}")
+    
+    # Detailed Training Config
+    _logger.info(f"Training Config:")
+    _logger.info(f"  - Accumulation Steps: {hparams.accumulation_steps}")
+    _logger.info(f"  - Batch Size Per GPU: {hparams.batch_size}")
+    _logger.info(f"  - Checkpoint Interval: {hparams.iters_per_checkpoint} steps")
+    _logger.info(f"  - Validation Interval: {hparams.iters_check_for_model_improvement} steps")
+    _logger.info(f"  - Total Iterations: {hparams.nb_iterations:_}")
+    _logger.info(f"  - Initial LR: {hparams.initial_learning_rate}")
+    _logger.info(f"  - Max LR: {hparams.max_learning_rate}")
+    _logger.info(f"  - Warmup Steps: {hparams.warmup_steps}")
+    
+    # Dynamic Stats Info
+    if getattr(hparams, 'use_external_embeddings', False):
+        _logger.info(f"Dynamic Stats: ENABLED")
+        _logger.info(f"  - Subset Size: {getattr(hparams, 'dynamic_stats_subset_size', 10)}")
+        _logger.info(f"  - Refresh Interval: {getattr(hparams, 'stats_refresh_interval', 100)}")
+        _logger.info(f"  - External Emb Dim: {getattr(hparams, 'external_emb_dim', 192)}")
+    else:
+        _logger.info(f"Dynamic Stats: DISABLED")
+        
     _logger.info('**' * 40 + '\n')
 
     # Initialize Dynamic Stats Manager placeholders
