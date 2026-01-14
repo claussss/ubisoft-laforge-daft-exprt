@@ -12,6 +12,9 @@ import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
 from dateutil.relativedelta import relativedelta
 from shutil import copyfile
@@ -27,6 +30,7 @@ from daft_exprt.logger import DaftExprtLogger
 from daft_exprt.loss import DaftExprtLoss
 from daft_exprt.model import DaftExprt
 from daft_exprt.utils import get_nb_jobs
+from daft_exprt.dynamic_stats import DynamicSpeakerStatsManager
 
 
 _logger = logging.getLogger(__name__)
@@ -324,8 +328,9 @@ def train(gpu, hparams, log_file):
     # ---------------------------------------------------------
     # prepare Data Loaders
     # ---------------------------------------------------------
+    num_workers = getattr(hparams, 'num_workers', 8)
     train_loader, train_sampler, val_loader, nb_training_examples = \
-        prepare_data_loaders(hparams, num_workers=8)
+        prepare_data_loaders(hparams, num_workers=num_workers)
     
     # ---------------------------------------------------------
     # display training info
@@ -343,6 +348,12 @@ def train(gpu, hparams, log_file):
     _logger.info(f"Nb total of epochs: {epochs:_}")
     _logger.info(f"Started at epoch: {epoch_offset:_}")
     _logger.info('**' * 40 + '\n')
+
+    # Initialize Dynamic Stats Manager placeholders
+    use_external_embeddings = getattr(hparams, 'use_external_embeddings', False)
+    stats_manager = None
+    if use_external_embeddings:
+        stats_refresh_interval = getattr(hparams, 'stats_refresh_interval', 100) # steps
 
     # =========================================================
     #                   MAIN TRAINNIG LOOP
@@ -378,6 +389,21 @@ def train(gpu, hparams, log_file):
                 inputs, targets = model.module.parse_batch(hparams.device, batch)
             else:
                 inputs, targets = model.parse_batch(hparams.device, batch)
+                
+            # Dynamic Stats Update and Processing
+            if use_external_embeddings:
+                if stats_manager is None:
+                     _logger.info("Initializing Dynamic Speaker Stats Manager (Lazy)...")
+                     stats_manager = DynamicSpeakerStatsManager(hparams)
+
+                if stats_manager is not None:
+                    # Refresh periodically
+                    if iteration % stats_refresh_interval == 0:
+                         stats_manager.refresh_stats()
+                         
+                    # Apply stats normalization and inject avg embedding
+                    # We need to pass device to ensure tensors are on GPU
+                    inputs = stats_manager.process_batch(inputs, hparams.device)
             
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size

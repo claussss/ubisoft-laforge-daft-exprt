@@ -14,13 +14,14 @@ class DaftExprtDataLoader(Dataset):
         1) load features, symbols and speaker ID
         2) convert symbols to sequence of one-hot vectors
     '''
-    def __init__(self, data_file, hparams, shuffle=True):
+    def __init__(self, data_file, hparams, shuffle=True, return_raw_stats=False):
         # check data file exists and extract lines
         assert(os.path.isfile(data_file))
         with open(data_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         self.data = [line.strip().split(sep='|') for line in lines]
         self.hparams = hparams
+        self.return_raw_stats = return_raw_stats
         
         # shuffle
         if shuffle:
@@ -69,6 +70,11 @@ class DaftExprtDataLoader(Dataset):
         with open(energies, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         energies = np.array([float(line.strip()) for line in lines])
+        
+        # Override normalize flag if return_raw_stats is set
+        if self.return_raw_stats:
+            normalize = False
+            
         # standardize energies based on speaker stats
         if normalize:
             zero_idxs = np.where(energies == 0.)[0]
@@ -87,6 +93,11 @@ class DaftExprtDataLoader(Dataset):
         with open(pitch, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         pitch = np.array([float(line.strip()) for line in lines])
+        
+        # Override normalize flag if return_raw_stats is set
+        if self.return_raw_stats:
+            normalize = False
+            
         # standardize voiced pitch based on speaker stats
         if normalize:
             zero_idxs = np.where(pitch == 0.)[0]
@@ -112,6 +123,7 @@ class DaftExprtDataLoader(Dataset):
         frames_energy = os.path.join(features_dir, f'{feature_file}.frames_nrg')
         symbols_pitch = os.path.join(features_dir, f'{feature_file}.symbols_f0')
         frames_pitch = os.path.join(features_dir, f'{feature_file}.frames_f0')
+        spk_emb_path = os.path.join(features_dir, f'{feature_file}.spk_emb.npy')
         
         # extract data
         try:
@@ -121,6 +133,18 @@ class DaftExprtDataLoader(Dataset):
             frames_energy = self.get_energies(frames_energy, speaker_id, normalize=False)
             symbols_pitch = self.get_pitch(symbols_pitch, speaker_id)
             frames_pitch = self.get_pitch(frames_pitch, speaker_id, normalize=False)
+            
+            # Load external speaker embedding if used
+            if hasattr(self.hparams, 'use_external_embeddings') and self.hparams.use_external_embeddings:
+                if os.path.exists(spk_emb_path):
+                    spk_emb = torch.from_numpy(np.load(spk_emb_path))
+                else:
+                    # Fallback or error? For now zero
+                    # print(f"WARNING: No embedding found for {feature_file}")
+                    spk_emb = torch.zeros(192) # Assume 192 for ECAPA
+            else:
+                spk_emb = torch.zeros(1)
+                
         except Exception as e:
             print(f"ERROR: Exception loading data in {features_dir}/{feature_file}: {e}")
             return None
@@ -165,7 +189,7 @@ class DaftExprtDataLoader(Dataset):
                 )
 
         return symbols, durations_float, durations_int, symbols_energy, symbols_pitch, \
-            frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file
+            frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file, spk_emb
     
     def _augment_data(self, symbols, durations_float, durations_int, symbols_energy, symbols_pitch,
                       frames_energy, frames_pitch, mel_spec, speaker_id):
@@ -324,7 +348,7 @@ class DaftExprtDataCollate():
         ''' Collate training batch
 
         :param batch:   [[symbols, durations_float, durations_int, symbols_energy, symbols_pitch,
-                          frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file], ...]
+                          frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file, spk_emb], ...]
 
         :return: collated batch of training samples
         '''
@@ -341,6 +365,11 @@ class DaftExprtDataCollate():
         symbols_pitch = torch.FloatTensor(len(batch), max_input_len).zero_()
         speaker_ids = torch.LongTensor(len(batch))
         
+        # Collate Speaker Embeddings
+        # Assumes all embs are same size
+        emb_dim = batch[0][11].shape[0]
+        spk_embs = torch.FloatTensor(len(batch), emb_dim).zero_()
+        
         for i in range(len(ids_sorted_decreasing)):
             # extract batch sequences
             symbols_seq = batch[ids_sorted_decreasing[i]][0]
@@ -356,6 +385,8 @@ class DaftExprtDataCollate():
             symbols_pitch[i, :symbols_pitch_seq.size(0)] = symbols_pitch_seq
             # add corresponding speaker ID
             speaker_ids[i] = batch[ids_sorted_decreasing[i]][8]
+            # add speaker embedding
+            spk_embs[i] = batch[ids_sorted_decreasing[i]][11]
         
         # find mel-spec max length
         max_output_len = max([x[7].size(1) for x in batch])
@@ -385,7 +416,7 @@ class DaftExprtDataCollate():
             feature_files.append(batch[ids_sorted_decreasing[i]][10])
         
         return symbols, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths, \
-            frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids, feature_dirs, feature_files
+            frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids, feature_dirs, feature_files, spk_embs
 
 
 def prepare_data_loaders(hparams, num_workers=1, drop_last=True):
@@ -397,8 +428,10 @@ def prepare_data_loaders(hparams, num_workers=1, drop_last=True):
     :return: Data Loaders for train and validation sets
     '''
     # get data and collate function ready
-    train_set = DaftExprtDataLoader(hparams.training_files, hparams)
-    val_set = DaftExprtDataLoader(hparams.validation_files, hparams)
+    # get data and collate function ready
+    use_raw = getattr(hparams, 'use_external_embeddings', False)
+    train_set = DaftExprtDataLoader(hparams.training_files, hparams, return_raw_stats=use_raw)
+    val_set = DaftExprtDataLoader(hparams.validation_files, hparams, return_raw_stats=use_raw)
     collate_fn = DaftExprtDataCollate(hparams)
     
     # get number of training examples

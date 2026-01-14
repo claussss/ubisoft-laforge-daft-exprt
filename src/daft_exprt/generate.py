@@ -294,7 +294,7 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
                              n_jobs, use_griffin_lim=True, batch_external_prosody=None,
                              vocoder=None, source_stats=None, reduce_buzz=False,
                              neutralize_prosody=False, neutralize_speaker_encoder=False,
-                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0):
+                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0, external_embeddings=None):
     ''' Generate batch mel-specs using Daft-Exprt
     '''
     # add speaker info to file name
@@ -393,18 +393,12 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
     # perform inference
     inputs = (symbols, dur_factors, energy_factors, pitch_factors, input_lengths,
               energy_refs, pitch_refs, mel_spec_refs, ref_lengths, speaker_ids)
-    try:
-        encoder_preds, decoder_preds, alignments = model.inference(
-            inputs, pitch_transform, hparams, external_tensors,
-            neutralize_prosody=neutralize_prosody,
-            neutralize_speaker_encoder=neutralize_speaker_encoder
-        )
-    except:
-        encoder_preds, decoder_preds, alignments = model.module.inference(
-            inputs, pitch_transform, hparams, external_tensors,
-            neutralize_prosody=neutralize_prosody,
-            neutralize_speaker_encoder=neutralize_speaker_encoder
-        )
+    encoder_preds, decoder_preds, alignments = model.inference(
+        inputs, pitch_transform, hparams, external_tensors,
+        neutralize_prosody=neutralize_prosody,
+        neutralize_speaker_encoder=neutralize_speaker_encoder,
+        external_embeddings=external_embeddings
+    )
     # parse outputs
     duration_preds, durations_int, energy_preds, pitch_preds, input_lengths = encoder_preds
     mel_spec_preds, output_lengths = decoder_preds
@@ -459,7 +453,7 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
                        n_jobs=1, use_griffin_lim=False, get_time_perf=False, external_prosody=None,
                        vocoder=None, source_stats=None, reduce_buzz=False,
                        neutralize_prosody=False, neutralize_speaker_encoder=False,
-                       alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0):
+                       alpha_dur=None, alpha_pitch=None, alpha_energy=None, external_embeddings=None):
     ''' Generate mel-specs using Daft-Exprt
 
         sentences = [
@@ -557,6 +551,12 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
         external_chunks = list(chunker(external_prosody, batch_size))
     else:
         external_chunks = [None] * len(sentence_chunks)
+    
+    if external_embeddings is not None:
+        external_embeddings_chunks = list(chunker(external_embeddings, batch_size))
+    else:
+        external_embeddings_chunks = [None] * len(sentence_chunks)
+
     with torch.no_grad():
         for idx in range(len(sentence_chunks)):
             batch_sentences = sentence_chunks[idx]
@@ -567,6 +567,8 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
             batch_speaker_ids = speaker_chunks[idx]
             batch_file_names = file_chunks[idx]
             batch_external = external_chunks[idx] if external_chunks[idx] is not None else None
+            batch_external_embeddings = external_embeddings_chunks[idx] if external_embeddings_chunks[idx] is not None else None
+
             sentence_begin = time.time() if get_time_perf else None
             batch_predictions =  generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_factors,
                                                               batch_energy_factors, batch_pitch_factors, pitch_transform,
@@ -575,7 +577,8 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
                                                               source_stats=source_stats, reduce_buzz=reduce_buzz,
                                                               neutralize_prosody=neutralize_prosody,
                                                               neutralize_speaker_encoder=neutralize_speaker_encoder,
-                                                              alpha_dur=alpha_dur, alpha_pitch=alpha_pitch, alpha_energy=alpha_energy)
+                                                              alpha_dur=alpha_dur, alpha_pitch=alpha_pitch, alpha_energy=alpha_energy,
+                                                              external_embeddings=batch_external_embeddings)
             predictions.update(batch_predictions)
             time_per_batch += [time.time() - sentence_begin] if get_time_perf else []
     

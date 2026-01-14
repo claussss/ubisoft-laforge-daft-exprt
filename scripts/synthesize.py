@@ -13,6 +13,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torchaudio
 
 from shutil import rmtree
 
@@ -25,6 +26,7 @@ from daft_exprt.generate import extract_reference_parameters, generate_mel_specs
 from daft_exprt.extract_features import (
     extract_energy as compute_energy_frames,
     extract_pitch,
+    extract_energy, # Added for direct use in new_speaker_stats logic
     mel_spectrogram_HiFi,
     rescale_wav_to_float32,
 )
@@ -34,7 +36,17 @@ from daft_exprt.utils import get_nb_jobs
 
 
 _logger = logging.getLogger(__name__)
-random.seed(1234)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(1234)
 
 
 '''
@@ -186,10 +198,11 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
     checkpoint_dict = torch.load(args.checkpoint, map_location=f'cuda:{0}')
     hparams = HyperParams(verbose=False, **checkpoint_dict['config_params'])
     # load model
+    device = torch.device(f'cuda:{0}' if torch.cuda.is_available() else 'cpu')
     torch.cuda.set_device(0)
-    model = DaftExprt(hparams).cuda(0)
+    model = DaftExprt(hparams).to(device)
     state_dict = {k.replace('module.', ''): v for k, v in checkpoint_dict['state_dict'].items()}
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
 
     # prepare sentences
     n_jobs = 1 #get_nb_jobs('max')
@@ -198,7 +211,102 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
     else:
         sentences, file_names = prepare_sentences_for_inference(args.text_file, args.output_dir, hparams, n_jobs)
         external_prosody = None
-    source_stats = _load_speaker_stats(args.new_speaker_stats) if args.new_speaker_stats else None # This is for normalizing symbol_prosody input
+
+    # update hparams with new speaker stats
+    external_embeddings = None
+    if args.new_speaker_stats is not None:
+        if os.path.isdir(args.new_speaker_stats):
+             _logger.info(f"Computing stats from directory: {args.new_speaker_stats}")
+             # Directory mode: Scan for wavs, compute stats and avg embedding (ECAPA)
+             try:
+                 from speechbrain.inference.speaker import EncoderClassifier
+             except ImportError:
+                 from speechbrain.pretrained import EncoderClassifier
+             
+             # Load Classifier
+             try:
+                 classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": device})
+             except Exception as e:
+                 _logger.error(f"Failed to load ECAPA model: {e}")
+                 raise e
+
+             wav_files = [os.path.join(args.new_speaker_stats, f) for f in os.listdir(args.new_speaker_stats) if f.endswith('.wav')]
+             if not wav_files:
+                 raise ValueError(f"No .wav files found in {args.new_speaker_stats}")
+                 
+             # Compute Stats and Embeddings
+             all_embs = []
+             
+             all_pitch = []
+             all_energy = []
+             
+             for wav_path in wav_files:
+                 # Load Audio
+                 signal, fs = torchaudio.load(wav_path)
+                 
+                 # Energy/Pitch
+                 # extract_features functions take (wav, fs, hparams)
+                 # wav should be float numpy
+                 wav_np = signal.squeeze().numpy()
+                 
+                 try:
+                     p = extract_pitch(wav_np, fs, hparams)
+                     e = extract_energy(wav_np, fs, hparams)
+                     
+                     all_pitch.extend(p[p > 0])
+                     all_energy.extend(e[e > 0])
+                 except Exception as err:
+                     _logger.warning(f"Feature extraction failed for {wav_path}: {err}")
+                 
+                 # Embedding
+                 # Resample for ECAPA if needed (16k)
+                 if fs != 16000:
+                     resampler = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)
+                     signal_16k = resampler(signal)
+                 else:
+                     signal_16k = signal
+                     
+                 emb = classifier.encode_batch(signal_16k.to(device))
+                 all_embs.append(emb.squeeze().cpu().numpy())
+                 
+             # Avg Stats
+             if len(all_pitch) > 0:
+                 p_mean = float(np.mean(all_pitch))
+                 p_std = float(np.std(all_pitch))
+             else:
+                 p_mean, p_std = 0.0, 1.0 # fallback
+                 
+             if len(all_energy) > 0:
+                 e_mean = float(np.mean(all_energy))
+                 e_std = float(np.std(all_energy))
+             else:
+                 e_mean, e_std = 0.0, 1.0
+            
+             # Avg Embedding
+             avg_emb = np.mean(np.array(all_embs), axis=0) # (192,)
+             external_embeddings = torch.from_numpy(avg_emb).unsqueeze(0).to(device) # (1, 192)
+             
+             # Format into hparams.stats structure
+             if not hasattr(hparams, 'stats'):
+                 hparams.stats = {}
+             hparams.stats['spk 0'] = {
+                 'pitch': {'mean': p_mean, 'std': p_std},
+                 'energy': {'mean': e_mean, 'std': e_std}
+             }
+             
+        elif os.path.isfile(args.new_speaker_stats):
+             stats = _load_speaker_stats(args.new_speaker_stats)
+             if not hasattr(hparams, 'stats'):
+                 hparams.stats = {}
+             # Assuming a single speaker stats file, apply to a dummy ID '0'
+             hparams.stats['spk 0'] = stats
+             _logger.info(f"Loaded speaker stats from file: {args.new_speaker_stats}")
+    
+    # Enable external embeddings flag for inference if we have them
+    if external_embeddings is not None:
+        hparams.use_external_embeddings = True
+
+    source_stats = hparams.stats.get('spk 0') if args.new_speaker_stats else None # This is for normalizing symbol_prosody input
     refs = []
     if args.symbol_prosody_file and os.path.isfile(args.style_bank):
         manifest_path = os.path.abspath(args.style_bank)
@@ -215,8 +323,12 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
             extract_reference_parameters(audio_ref, args.style_bank, hparams)
         cache_refs = [os.path.join(args.style_bank, x) for x in os.listdir(args.style_bank) if x.endswith('.npz')]
         refs = [random.choice(cache_refs) for _ in range(len(sentences))]
-    # choose a fixed speaker ID for all sentences (default speaker 10)
-    speaker_ids = [10 for _ in range(len(sentences))]
+    
+    # Use speaker_id 0 to match our injected stats if in zero-shot mode
+    if args.new_speaker_stats is not None and (os.path.isdir(args.new_speaker_stats) or os.path.isfile(args.new_speaker_stats)):
+        speaker_ids = [0 for _ in range(len(sentences))]
+    else:
+        speaker_ids = [12 for _ in range(len(sentences))] # Fallback/Legacy
     
     vocoder = None
     if not use_griffin_lim:
@@ -244,6 +356,11 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
         if pitch_factors is not None:
             pitch_factors[1].append([pitch_factor for _ in range(nb_symbols)])
 
+    # Expand external embeddings to batch size
+    batch_ext_embs = None
+    if external_embeddings is not None:
+        batch_ext_embs = external_embeddings.repeat(len(sentences), 1)
+        
     # generate mel-specs and synthesize audios with Griffin-Lim
     predictions = generate_mel_specs(model, sentences, file_names, speaker_ids, refs, args.output_dir,
                        hparams, dur_factors, energy_factors, pitch_factors, args.batch_size,
@@ -251,7 +368,8 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
                        source_stats=source_stats, reduce_buzz=args.reduce_buzz,
                        neutralize_prosody=args.neutralize_prosody,
                        neutralize_speaker_encoder=args.neutralize_speaker_encoder,
-                       alpha_dur=args.alpha_dur, alpha_pitch=args.alpha_pitch, alpha_energy=args.alpha_energy)
+                       alpha_dur=args.alpha_dur, alpha_pitch=args.alpha_pitch, alpha_energy=args.alpha_energy,
+                       external_embeddings=batch_ext_embs)
     compare_paths = None
     if args.plot_prosody_files_to_compare:
         compare_paths = _load_manifest(os.path.abspath(args.plot_prosody_files_to_compare), len(sentences), split_text=True)
