@@ -426,6 +426,22 @@ def train(gpu, hparams, log_file):
                     # Apply stats normalization and inject avg embedding
                     # We need to pass device to ensure tensors are on GPU
                     inputs = stats_manager.process_batch(inputs, hparams.device)
+                    
+                    # CRITICAL FIX: Ensure targets used for loss are ALSO normalized.
+                    # stats_manager only processes 'inputs'. 'targets' (created earlier) still hold RAW values.
+                    # We must update 'targets' with the normalized symbols_energy/pitch from 'inputs'
+                    # to ensure the Adversary targets Normalized Prosody (not Raw).
+                    
+                    # inputs structure: (symbols, durations_float, durations_int, symbols_energy, symbols_pitch, ...)
+                    # targets structure: (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch)
+                    
+                    # Extract normalized values from processed inputs
+                    norm_symbols_energy = inputs[3]
+                    norm_symbols_pitch = inputs[4]
+                    
+                    # Reconstruct targets (Tuple is immutable)
+                    # Keep frames_pitch (targets[5]) as RAW because Pitch Consistency likely expects Raw/Standard matching the Pitch Predictor.
+                    targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
             
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size
