@@ -214,6 +214,51 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
 
     # update hparams with new speaker stats
     external_embeddings = None
+    
+    # Logic to extract external embeddings if a directory is provided
+    spk_emb_dir = getattr(args, 'spk_emb_audios_dir', None)
+    if spk_emb_dir and os.path.isdir(spk_emb_dir):
+         _logger.info(f"Computing speaker embedding from directory: {spk_emb_dir}")
+         try:
+             from speechbrain.inference.speaker import EncoderClassifier
+         except ImportError:
+             from speechbrain.pretrained import EncoderClassifier
+         
+         # Load Classifier
+         try:
+             # Use a local path if needed or default to huggingface. 
+             # Assuming standard location or internet access.
+             classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": device})
+         except Exception as e:
+             _logger.error(f"Failed to load ECAPA model: {e}")
+             raise e
+
+         wav_files = [os.path.join(spk_emb_dir, f) for f in os.listdir(spk_emb_dir) if f.endswith('.wav')]
+         if not wav_files:
+             raise ValueError(f"No .wav files found in {spk_emb_dir}")
+             
+         all_embs = []
+         for wav_path in wav_files:
+             # Load Audio
+             signal, fs = torchaudio.load(wav_path)
+             
+             # Resample for ECAPA if needed (16k)
+             if fs != 16000:
+                 resampler = torchaudio.transforms.Resample(orig_freq=fs, new_freq=16000)
+                 signal_16k = resampler(signal)
+             else:
+                 signal_16k = signal
+                 
+             # Encode
+             with torch.no_grad():
+                 emb = classifier.encode_batch(signal_16k.to(device))
+             all_embs.append(emb.squeeze().cpu().numpy())
+         
+         # Average Embedding
+         avg_emb = np.mean(np.array(all_embs), axis=0) # (192,)
+         external_embeddings = torch.from_numpy(avg_emb).unsqueeze(0).to(device) # (1, 192)
+         _logger.info(f"Computed average speaker embedding from {len(wav_files)} files. Shape: {avg_emb.shape}")
+
     if args.new_speaker_stats is not None:
         if os.path.isdir(args.new_speaker_stats):
              _logger.info(f"Computing stats from directory: {args.new_speaker_stats}")
@@ -590,6 +635,8 @@ if __name__ == '__main__':
                         help='Pitch exaggeration factor (variance scaling). Default 1.0 (no change).')
     parser.add_argument('--alpha_energy', type=float, default=1.0,
                         help='Energy exaggeration factor (variance scaling). Default 1.0 (no change).')
+    parser.add_argument('--spk_emb_audios_dir', type=str, default='',
+                        help='Directory containing .wav files to compute average speaker embedding for zero-shot conditioning.')
     
     args = parser.parse_args()
     

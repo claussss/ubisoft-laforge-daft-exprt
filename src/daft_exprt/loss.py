@@ -44,63 +44,21 @@ class DaftExprtLoss(nn.Module):
         :param iteration:       current training iteration
         '''
         # extract ground-truth targets
-        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch)
-        _, _, _, mel_spec_targets, output_lengths, _ = targets
+        # targets can be 6 or 7 elements (backward compatibility)
+        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch, [speaker_ids])
+        if len(targets) == 7:
+            _, symbols_energy, symbols_pitch, mel_spec_targets, output_lengths, frames_pitch, speaker_ids = targets
+        else:
+            _, symbols_energy, symbols_pitch, mel_spec_targets, output_lengths, frames_pitch = targets
+            speaker_ids = None
         mel_spec_targets.requires_grad = False
         
         # extract predictions
-        # outputs = (None, None, encoder_preds, decoder_preds, weights)
-        # decoder_preds = (mel_preds, output_lengths)
-        # outputs = (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds)
-        mel_spec_preds = outputs[0]
-        adversary_preds = outputs[9] if len(outputs) > 9 else None
-        
-        # Extract ground truth pitch/energy for adversary (symbol level)
-        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths)
-        symbols_energy = targets[1]
-        symbols_pitch = targets[2]
-        
-        # We need output_lengths to normalize loss
-        # It's not in targets tuple passed from train.py?
-        # Let's check train.py. In train.py:
-        # inputs, targets = model.parse_batch(gpu, batch)
-        # inputs = (..., output_lengths, ...)
-        # targets = (..., mel_specs, speaker_ids)
-        # Wait, parse_batch in model.py (my modified version):
-        # targets = mel_specs
-        # So targets is just mel_specs?
-        # Let's check my modified model.py parse_batch:
-        # return inputs, targets
-        # where targets = mel_specs.
-        # But wait, in the original code, targets was a tuple.
-        # I changed it to just mel_specs in my thought process but I need to verify what I actually wrote.
-        # I wrote: targets = mel_specs
-        # So targets is a tensor, not a tuple.
-        
-        # However, I need output_lengths for the loss normalization.
-        # inputs has output_lengths.
-        # But forward receives outputs, targets, iteration.
-        # It doesn't receive inputs.
-        # I should probably pass output_lengths in targets or change how loss is called.
-        # Let's check how I modified model.py.
-        # I changed parse_batch to return targets = mel_specs.
-        # I should probably change it to return (mel_specs, output_lengths) so I can use it in loss.
-        
-        # For now, let's assume I will fix model.py to return (mel_specs, output_lengths) in targets.
-        # Or I can change loss signature to accept lengths.
-        # But standard pytorch training loops usually pass outputs, targets.
-        
-        # Let's assume targets = (mel_specs, output_lengths).
-        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch)
-        _, _, _, mel_spec_targets, output_lengths, _ = targets
-        mel_spec_targets.requires_grad = False
-        output_lengths.requires_grad = False
-        
-        # extract predictions
-        # outputs = (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds)
+        # outputs = (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds, spk_preds)
         mel_spec_preds = outputs[0]
         input_lengths = outputs[6]
         adversary_preds = outputs[9] if len(outputs) > 9 else None
+        spk_preds = outputs[10] if len(outputs) > 10 else None
             
         # compute mel-spec loss
         mel_spec_l1_loss = self.L1Loss(mel_spec_preds, mel_spec_targets)  # (B, n_mel_channels, T_max)
@@ -219,6 +177,22 @@ class DaftExprtLoss(nn.Module):
                 # Normalize by number of voiced frames (plus epsilon)
                 pitch_consistency_loss = torch.sum(pitch_mse) / (torch.sum(combined_mask.float()) + 1e-5)
                 loss += self.pitch_consistency_weight * pitch_consistency_loss
+        
+        # Accent Adversarial Loss (NEW)
+        accent_adv_loss = torch.tensor(0.0, device=loss.device)
+        
+        if spk_preds is not None and speaker_ids is not None:
+            # Apply warmup for adversarial weight
+            warmup_steps = getattr(self, 'warmup_steps', 10000)
+            adv_max_weight = getattr(self, 'adv_max_weight', 1e-2)
+            
+            # Gradual increase: weight = min(adv_max_weight, iteration * warmup^-1.5 * adv_max / warmup^-0.5)
+            weight_iter = iteration * (warmup_steps ** -1.5) * adv_max_weight / (warmup_steps ** -0.5)
+            weight = min(adv_max_weight, weight_iter)
+            
+            # Cross-entropy loss for speaker classification
+            accent_adv_loss = weight * torch.nn.functional.cross_entropy(spk_preds, speaker_ids)
+            loss += accent_adv_loss
 
         # create individual loss tracker
         individual_loss = {
@@ -226,7 +200,8 @@ class DaftExprtLoss(nn.Module):
             'mel_spec_l2_loss': mel_spec_l2_loss.item(),
             'adv_loss': adv_loss.item(),
             'energy_consistency_loss': energy_consistency_loss.item(),
-            'pitch_consistency_loss': pitch_consistency_loss.item()
+            'pitch_consistency_loss': pitch_consistency_loss.item(),
+            'accent_adv_loss': accent_adv_loss.item()
         }
 
         # Log

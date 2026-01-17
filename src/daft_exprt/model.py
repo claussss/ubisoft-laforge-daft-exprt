@@ -272,6 +272,133 @@ class FFTBlock(nn.Module):
         return outputs
 
 
+
+class AccentEncoder(nn.Module):
+    """ Accent Encoder: Extracts global accent style from mel-spectrograms + prosody """
+    def __init__(self, hparams):
+        super(AccentEncoder, self).__init__()
+        nb_mels = hparams.n_mel_channels
+        Tuple = namedtuple('Tuple', hparams.accent_encoder)
+        hparams_ae = Tuple(**hparams.accent_encoder)
+        
+        self.pos_enc = PositionalEncoding(hparams_ae.hidden_embed_dim)
+        self.energy_embedding = ConvNorm1D(1, hparams_ae.hidden_embed_dim, kernel_size=hparams_ae.conv_kernel,
+                                           stride=1, padding=int((hparams_ae.conv_kernel - 1) / 2), dilation=1, w_init_gain='linear')
+        self.pitch_embedding = ConvNorm1D(1, hparams_ae.hidden_embed_dim, kernel_size=hparams_ae.conv_kernel,
+                                          stride=1, padding=int((hparams_ae.conv_kernel - 1) / 2), dilation=1, w_init_gain='linear')
+        
+        self.convs = nn.Sequential(
+            ConvNorm1D(nb_mels, hparams_ae.conv_channels, kernel_size=hparams_ae.conv_kernel, stride=1,
+                       padding=int((hparams_ae.conv_kernel - 1) / 2), dilation=1, w_init_gain='relu'),
+            nn.ReLU(), nn.LayerNorm(hparams_ae.conv_channels), nn.Dropout(hparams_ae.conv_dropout),
+            ConvNorm1D(hparams_ae.conv_channels, hparams_ae.conv_channels, kernel_size=hparams_ae.conv_kernel, stride=1,
+                       padding=int((hparams_ae.conv_kernel - 1) / 2), dilation=1, w_init_gain='relu'),
+            nn.ReLU(), nn.LayerNorm(hparams_ae.conv_channels), nn.Dropout(hparams_ae.conv_dropout),
+            ConvNorm1D(hparams_ae.conv_channels, hparams_ae.hidden_embed_dim, kernel_size=hparams_ae.conv_kernel, stride=1,
+                       padding=int((hparams_ae.conv_kernel - 1) / 2), dilation=1, w_init_gain='relu'),
+            nn.ReLU(), nn.LayerNorm(hparams_ae.hidden_embed_dim), nn.Dropout(hparams_ae.conv_dropout)
+        )
+        
+        blocks = [FFTBlock(hparams_ae) for _ in range(hparams_ae.nb_blocks)]
+        self.blocks = nn.ModuleList(blocks)
+    
+    def forward(self, frames_energy, frames_pitch, mel_specs, output_lengths):
+        pos = self.pos_enc(output_lengths.unsqueeze(1))
+        energy = self.energy_embedding(frames_energy.unsqueeze(2))
+        pitch = self.pitch_embedding(frames_pitch.unsqueeze(2))
+        outputs = self.convs(mel_specs.transpose(1, 2))
+        mask = ~get_mask_from_lengths(output_lengths)
+        outputs = (outputs + energy + pitch + pos).masked_fill(mask.unsqueeze(2), 0)
+        for block in self.blocks:
+            outputs = block(outputs, None, mask)
+        accent_embedding = torch.sum(outputs, dim=1) / output_lengths.unsqueeze(1)
+        return accent_embedding
+
+
+class SpeakerClassifier(nn.Module):
+    """ Speaker Classifier with GRL for accent disentanglement """
+    def __init__(self, hparams):
+        super(SpeakerClassifier, self).__init__()
+        nb_speakers = hparams.n_speakers
+        embed_dim = hparams.accent_encoder['hidden_embed_dim']
+        self.classifier = nn.Sequential(
+            GradientReversal(hparams),
+            LinearNorm(embed_dim, embed_dim, w_init_gain='relu'), nn.ReLU(),
+            LinearNorm(embed_dim, embed_dim, w_init_gain='relu'), nn.ReLU(),
+            LinearNorm(embed_dim, nb_speakers, w_init_gain='linear')
+        )
+    
+    def forward(self, x):
+        return self.classifier(x)
+
+
+class StyleAdapter(nn.Module):
+    """ Style Adapter: Generates FiLM parameters from fused accent+speaker embeddings """
+    def __init__(self, hparams):
+        super(StyleAdapter, self).__init__()
+        accent_dim = hparams.accent_encoder['hidden_embed_dim']
+        speaker_dim = hparams.phoneme_encoder['hidden_embed_dim']
+        input_dim = accent_dim + speaker_dim
+        hidden_dim = getattr(hparams, 'style_adapter_hidden', 512)
+        
+        # Determine decoder hidden dim (accounts for concatenation mode)
+        if getattr(hparams, 'use_concatenation', False):
+            decoder_hidden_dim = hparams.phoneme_encoder['hidden_embed_dim'] * 3
+        else:
+            decoder_hidden_dim = hparams.phoneme_encoder['hidden_embed_dim']
+        
+        self.module_params = {
+            'phoneme_encoder': (hparams.phoneme_encoder['nb_blocks'], hparams.phoneme_encoder['hidden_embed_dim']),
+            'upsampling': (3, hparams.phoneme_encoder['hidden_embed_dim']),
+            'frame_decoder': (hparams.frame_decoder['nb_blocks'], decoder_hidden_dim)
+        }
+        
+        nb_tot_film_params = sum(nb_blocks * channels for nb_blocks, channels in self.module_params.values())
+        
+        self.gamma_predictor = nn.Sequential(
+            LinearNorm(input_dim, hidden_dim, w_init_gain='relu'), nn.ReLU(),
+            LinearNorm(hidden_dim, nb_tot_film_params, w_init_gain='linear')
+        )
+        self.beta_predictor = nn.Sequential(
+            LinearNorm(input_dim, hidden_dim, w_init_gain='relu'), nn.ReLU(),
+            LinearNorm(hidden_dim, nb_tot_film_params, w_init_gain='linear')
+        )
+        
+        self.post_mult_weight = hparams.post_mult_weight
+        if self.post_mult_weight > 0:
+            nb_post_multipliers = sum(params[0] for params in self.module_params.values())
+            self.post_multipliers = Parameter(torch.empty(2, nb_post_multipliers))
+            nn.init.xavier_uniform_(self.post_multipliers, gain=nn.init.calculate_gain('linear'))
+        else:
+            self.post_multipliers = 1.0
+    
+    def forward(self, combined_emb):
+        gammas = self.gamma_predictor(combined_emb)
+        betas = self.beta_predictor(combined_emb)
+        
+        film_params = {}
+        column_idx, block_idx = 0, 0
+        
+        for module_name, (nb_blocks, channels) in self.module_params.items():
+            module_nb_params = nb_blocks * channels
+            module_gammas = gammas[:, column_idx:column_idx + module_nb_params].view(-1, nb_blocks, channels)
+            module_betas = betas[:, column_idx:column_idx + module_nb_params].view(-1, nb_blocks, channels)
+            
+            if self.post_mult_weight > 0:
+                gamma_post = self.post_multipliers[0, block_idx:block_idx + nb_blocks].unsqueeze(0).unsqueeze(-1)
+                beta_post = self.post_multipliers[1, block_idx:block_idx + nb_blocks].unsqueeze(0).unsqueeze(-1)
+                module_gammas = gamma_post * module_gammas + 1
+                module_betas = beta_post * module_betas
+            else:
+                module_gammas = module_gammas + 1
+            
+            film_params[module_name] = torch.cat((module_gammas, module_betas), dim=2)
+            block_idx += nb_blocks
+            column_idx += module_nb_params
+        
+        return film_params
+
+
 class GaussianUpsamplingModule(nn.Module):
     ''' Gaussian Upsampling Module:
         - Duration Projection
@@ -306,7 +433,7 @@ class GaussianUpsamplingModule(nn.Module):
             nn.Softplus()
         )
     
-    def forward(self, x, durations_float, durations_int, energies, pitch, input_lengths):
+    def forward(self, x, durations_float, durations_int, energies, pitch, input_lengths, film_params=None):
         ''' Forward function of Gaussian Upsampling Module:
             x = (B, L_max, hidden_embed_dim)
             durations_float = (B, L_max)
@@ -314,16 +441,48 @@ class GaussianUpsamplingModule(nn.Module):
             energies = (B, L_max)
             pitch = (B, L_max)
             input_lengths = (B, )
+            film_params = (B, 3, 2*hidden_embed_dim) or None - FiLM params for 3 projections
         '''
+        embed_dim = x.size(2)
+        
         # project durations
         durations = durations_float.unsqueeze(2)  # (B, L_max, 1)
         durations = self.duration_projection(durations)  # (B, L_max, hidden_embed_dim)
+        
+        # Apply FiLM to duration projection
+        if film_params is not None:
+            # Block 0 for Duration
+            fp_dur = film_params[:, 0, :]  # (B, 2*embed_dim)
+            gamma = fp_dur[:, :embed_dim].unsqueeze(1)  # (B, 1, embed_dim)
+            beta = fp_dur[:, embed_dim:].unsqueeze(1)  # (B, 1, embed_dim)
+            durations = gamma * durations + beta
+            durations = torch.nn.functional.relu(durations)  # Critical: allows gating
+        
         # project energies
         energies = energies.unsqueeze(2)  # (B, L_max, 1)
         energies = self.energy_projection(energies)  # (B, L_max, hidden_embed_dim)
+        
+        # Apply FiLM to energy projection
+        if film_params is not None:
+            # Block 1 for Energy
+            fp_nrg = film_params[:, 1, :]
+            gamma = fp_nrg[:, :embed_dim].unsqueeze(1)
+            beta = fp_nrg[:, embed_dim:].unsqueeze(1)
+            energies = gamma * energies + beta
+            energies = torch.nn.functional.relu(energies)
+        
         # project pitch
         pitch = pitch.unsqueeze(2)  # (B, L_max, 1)
         pitch = self.pitch_projection(pitch)  # (B, L_max, hidden_embed_dim)
+        
+        # Apply FiLM to pitch projection
+        if film_params is not None:
+            # Block 2 for Pitch
+            fp_f0 = film_params[:, 2, :]
+            gamma = fp_f0[:, :embed_dim].unsqueeze(1)
+            beta = fp_f0[:, embed_dim:].unsqueeze(1)
+            pitch = gamma * pitch + beta
+            pitch = torch.nn.functional.relu(pitch)
         
         # add energy and pitch to encoded input symbols
         if self.use_concatenation:
@@ -347,6 +506,10 @@ class GaussianUpsamplingModule(nn.Module):
         mask = ~get_mask_from_lengths(input_lengths) # (B, L_max)
         ranges = ranges.masked_fill(mask, 1)  # (B, L_max)
         
+        # STABILITY: Clamp ranges to prevent NaN/invalid stds in Normal distribution
+        # Ensure all ranges are >= epsilon to avoid division by zero or negative stds
+        ranges = torch.clamp(ranges, min=1e-3)  # Minimum std of 0.001
+        
         # perform Gaussian upsampling
         # compute Gaussian means
         means = durations_int.float() / 2  # (B, L_max)
@@ -355,6 +518,12 @@ class GaussianUpsamplingModule(nn.Module):
         # compute Gaussian distributions
         means = means.unsqueeze(-1)  # (B, L_max, 1)
         stds = ranges.unsqueeze(-1)  # (B, L_max, 1)
+        
+        # STABILITY: Additional check to ensure no NaN/Inf in means or stds
+        means = torch.nan_to_num(means, nan=0.0, posinf=1e6,  neginf=-1e6)
+        stds = torch.nan_to_num(stds, nan=1.0, posinf=1e6, neginf=1e-3)
+        stds = torch.clamp(stds, min=1e-3)  # Ensure positive
+        
         gaussians = Normal(means, stds)  # (B, L_max, 1)
         # create frames idx tensor
         nb_frames_max = torch.max(cumsum)  # T_max
@@ -487,7 +656,12 @@ class DaftExprt(nn.Module):
         self.n_speakers = hparams.n_speakers
         self.hidden_embed_dim = hparams.phoneme_encoder['hidden_embed_dim']
         
-        # Components
+        # Accent Transfer Components (NEW)
+        self.accent_encoder = AccentEncoder(hparams)
+        self.speaker_classifier = SpeakerClassifier(hparams)
+        self.style_adapter = StyleAdapter(hparams)
+        
+        # Core Components
         self.phoneme_encoder = PhonemeEncoder(hparams)
         self.gaussian_upsampling = GaussianUpsamplingModule(hparams)
         
@@ -500,7 +674,7 @@ class DaftExprt(nn.Module):
         # External Embeddings Configuration
         self.use_external_embeddings = getattr(hparams, 'use_external_embeddings', False)
         
-        # prosody adversary
+        # Prosody adversary (for phoneme encoder disentanglement)
         self.adversary = None
         if getattr(hparams, 'adversarial_weight', 0) > 0:
             self.adversary = ProsodyAdversary(hparams.phoneme_encoder['hidden_embed_dim'])
@@ -516,33 +690,6 @@ class DaftExprt(nn.Module):
         else:
             self.spk_embedding = nn.Embedding(self.n_speakers, self.hidden_embed_dim)
             torch.nn.init.xavier_uniform_(self.spk_embedding.weight.data)
-        
-        # FiLM generator for Frame Decoder
-        # Frame Decoder needs FiLM params: nb_blocks * conv_channels * 2 (gamma, beta)
-        # We use the same structure as ProsodyEncoder's projection but only for decoder
-        decoder_nb_blocks = hparams.frame_decoder['nb_blocks']
-        
-        # Determine decoder hidden dim (Highway support)
-        if getattr(hparams, 'use_concatenation', False):
-            self.decoder_hidden_dim = self.hidden_embed_dim * 3
-        else:
-            self.decoder_hidden_dim = self.hidden_embed_dim
-            
-        # PositionWiseConvFF uses hparams.conv_channels.
-        # BUT, the FiLM modulation (gammas * outputs + betas) is applied to the output of the block,
-        # which has size (B, L_max, hidden_embed_dim).
-        # So nb_film_params per block = 2 * hidden_embed_dim.
-        # Wait, let's check PositionWiseConvFF.forward:
-        # outputs = gammas * outputs + betas
-        # outputs size is (B, L_max, hidden_embed_dim).
-        # So gammas/betas must be (B, 1, hidden_embed_dim).
-        # Yes. So we need 2 * decoder_hidden_dim per block.
-        
-        nb_film_params_per_block = 2 * self.decoder_hidden_dim
-        self.nb_decoder_film_params = decoder_nb_blocks * nb_film_params_per_block
-        
-        self.gammas_predictor = LinearNorm(self.hidden_embed_dim, self.nb_decoder_film_params // 2, w_init_gain='linear')
-        self.betas_predictor = LinearNorm(self.hidden_embed_dim, self.nb_decoder_film_params // 2, w_init_gain='linear')
         
     
     def parse_batch(self, device, batch):
@@ -575,14 +722,24 @@ class DaftExprt(nn.Module):
         # create inputs and targets
         inputs = (symbols, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths,
                   frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids, spk_embs)
-        targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch)
+        targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch, speaker_ids)
         
         return inputs, targets
     
     def forward(self, inputs):
-        ''' Forward function of DaftExprt
-        '''
-        # extract inputs
+        """
+        Forward function of DaftExprt with Accent Transfer
+        
+        New flow:
+        1. Get speaker embedding
+        2. Encode accent (self-reference from target mel)
+        3. Speaker classification (GRL for disentanglement)
+        4. Fuse accent + speaker -> generate FiLM params
+        5. Forward through phoneme encoder (with FiLM)
+        6. Gaussian upsampling (with FiLM)
+        7. Frame decoder (with FiLM)
+        """
+        # Extract inputs
         if len(inputs) == 12:
             symbols, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths, \
                 frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids, spk_embs = inputs
@@ -591,59 +748,58 @@ class DaftExprt(nn.Module):
                 frames_energy, frames_pitch, mel_specs, output_lengths, speaker_ids = inputs
             spk_embs = None
         
-        # 1. Encode Phonemes (No speaker conditioning)
-        # Pass None for film_params
-        x = self.phoneme_encoder(symbols, None, input_lengths) # (B, L_max, hidden_embed_dim)
-        encoder_outputs = x
-        
-        # 2. Gaussian Upsampling (using ground truth prosody)
-        # We use the ground truth durations, energy, pitch provided in inputs
-        x, weights = self.gaussian_upsampling(x, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths) # (B, T_max, hidden_embed_dim)
-        
-        # 3. Frame Decoder (Conditioned on Speaker Embedding)
-        # Get speaker embedding
+        # 1. Get speaker embedding
         if self.use_external_embeddings:
-            # Normalize and Project
-            # spk_embs should be provided in inputs if use_external_embeddings is True
             if spk_embs is None:
                 raise ValueError("Model configured for external embeddings but None provided.")
-                
-            spk_emb = torch.nn.functional.normalize(spk_embs, p=2, dim=-1) # L2 normalize
-            
-            # Always project/adapt
+            spk_emb = torch.nn.functional.normalize(spk_embs, p=2, dim=-1)  # L2 normalize
             spk_emb = self.spk_projection(spk_emb)
         else:
-            spk_emb = self.spk_embedding(speaker_ids) # (B, hidden_embed_dim)
+            spk_emb = self.spk_embedding(speaker_ids)  # (B, hidden_embed_dim)
         
-        # Generate FiLM params
-        gammas = self.gammas_predictor(spk_emb) # (B, nb_decoder_film_params // 2)
-        betas = self.betas_predictor(spk_emb)   # (B, nb_decoder_film_params // 2)
+        # 2. Encode accent (self-reference: use current batch features)
+        accent_emb = self.accent_encoder(
+            frames_energy, frames_pitch, mel_specs, output_lengths
+        )  # (B, hidden_embed_dim)
         
-        # Reshape for Decoder: (B, nb_blocks, nb_film_params_per_block)
-        # nb_film_params_per_block = 2 * decoder_hidden_dim
-        # gammas/betas are currently flat for all blocks
-        B = spk_emb.size(0)
-        nb_blocks = self.frame_decoder.blocks.__len__() # Accessing ModuleList length
+        # 3. Speaker classification (for adversarial training with GRL)
+        spk_preds = self.speaker_classifier(accent_emb)  # (B, n_speakers)
         
-        gammas = gammas.view(B, nb_blocks, -1)
-        betas = betas.view(B, nb_blocks, -1)
+        # 4. Fuse accent + speaker and generate FiLM parameters
+        combined_emb = torch.cat([accent_emb, spk_emb], dim=-1)  # (B, 2*hidden_dim)
+        film_params_dict = self.style_adapter(combined_emb)
+        # Returns: {'phoneme_encoder': (B, 4, 256), 'upsampling': (B, 3, 256), 'frame_decoder': (B, 4, 256)}
         
-        # Apply "delta regime" (gammas = 1 + delta) - standard in FiLM
-        gammas = gammas + 1
+        # 5. Encode Phonemes (with accent conditioning)
+        x = self.phoneme_encoder(
+            symbols, 
+            film_params_dict['phoneme_encoder'], 
+            input_lengths
+        )  # (B, L_max, hidden_embed_dim)
+        encoder_outputs = x
         
-        film_params = torch.cat((gammas, betas), dim=2) # (B, nb_blocks, 2 * decoder_hidden_dim)
+        # 6. Gaussian Upsampling (with accent conditioning)
+        x, weights = self.gaussian_upsampling(
+            x, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths,
+            film_params=film_params_dict['upsampling']
+        )  # (B, T_max, hidden_embed_dim)
         
-        # Decode
-        mel_preds = self.frame_decoder(x, film_params, output_lengths) # (B, n_mel_channels, T_max)
+        # 7. Frame Decoder (with accent conditioning)
+        mel_preds = self.frame_decoder(
+            x, 
+            film_params_dict['frame_decoder'], 
+            output_lengths
+        )  # (B, n_mel_channels, T_max)
         
-        # Adversarial Disentanglement
+        # 8. Phoneme encoder adversarial disentanglement (existing)
         adversary_preds = None
         if self.adversary is not None:
             adversary_preds = self.adversary(encoder_outputs, alpha=1.0)
 
-        # Return flat tuple matching loss.py expectation:
-        # (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds)
-        return mel_preds, durations_float, symbols_pitch, symbols_energy, None, None, input_lengths, output_lengths, weights, adversary_preds
+        # Return flat tuple matching loss.py expectation
+        # We add spk_preds at the end for accent adversarial loss
+        return mel_preds, durations_float, symbols_pitch, symbols_energy, None, None, \
+               input_lengths, output_lengths, weights, adversary_preds, spk_preds
     def get_int_durations(self, duration_preds, hparams):
         ''' Convert float durations to integer frame durations
         '''

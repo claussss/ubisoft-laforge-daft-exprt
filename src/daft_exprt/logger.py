@@ -57,8 +57,12 @@ class DaftExprtLogger(SummaryWriter):
         targets = val_targets[idx]
         outputs = val_outputs[idx]
         # extract predicted outputs and ground-truth values
-        # extract predicted outputs and ground-truth values
-        duration_targets, energy_targets, pitch_targets, mel_spec_targets, _, _ = targets
+        # extract predicted outputs        # Extract validation targets (now 7 elements: added speaker_ids)
+        # targets = (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch, speaker_ids)
+        if len(targets) == 7:
+            duration_targets, energy_targets, pitch_targets, mel_spec_targets, _, _, _ = targets
+        else:
+            duration_targets, energy_targets, pitch_targets, mel_spec_targets, _, _ = targets
         
         # New flat tuple structure:
         # (mel_preds, durations, pitch_preds, energy_preds, src_mask, mel_mask, src_lens, mel_lens, attn_logprobs, adversary_preds)
