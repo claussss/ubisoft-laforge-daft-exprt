@@ -392,7 +392,7 @@ def train(gpu, hparams, log_file):
         stats_refresh_interval = getattr(hparams, 'stats_refresh_interval', 100) # steps
 
     # =========================================================
-    #                   MAIN TRAINNIG LOOP
+    #                   MAIN TRAINING LOOP
     # =========================================================
     # set variables
     tot_loss = 0.

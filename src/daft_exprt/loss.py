@@ -12,7 +12,6 @@ class DaftExprtLoss(nn.Module):
         self.mel_spec_weight = hparams.mel_spec_weight
         
         self.L1Loss = nn.L1Loss(reduction='none').to(device)
-        self.L1Loss = nn.L1Loss(reduction='none').to(device)
         self.MSELoss = nn.MSELoss(reduction='none').to(device)
         
         # Weights
