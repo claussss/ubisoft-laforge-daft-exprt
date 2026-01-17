@@ -19,6 +19,10 @@ class DaftExprtLoss(nn.Module):
         self.adversarial_weight = getattr(hparams, 'adversarial_weight', 0.0)
         self.energy_consistency_weight = getattr(hparams, 'energy_consistency_weight', 0.0)
         
+        # Accent adversarial loss config (NEW)
+        self.warmup_steps = getattr(hparams, 'warmup_steps', 10000)
+        self.adv_max_weight = getattr(hparams, 'adv_max_weight', 1e-2)
+        
         # Smoothing for consistency loss
         self.avg_pool = nn.AvgPool1d(kernel_size=5, stride=1, padding=2)
         

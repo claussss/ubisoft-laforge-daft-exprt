@@ -369,6 +369,19 @@ def train(gpu, hparams, log_file):
         _logger.info(f"  - External Emb Dim: {getattr(hparams, 'external_emb_dim', 192)}")
     else:
         _logger.info(f"Dynamic Stats: DISABLED")
+    
+    # Accent Encoder Config (NEW)
+    if hasattr(hparams, 'accent_encoder'):
+        _logger.info(f"Accent Encoder: ENABLED")
+        _logger.info(f"  - Config: {hparams.accent_encoder}")
+        _logger.info(f"  - Lambda Reversal (GRL): {getattr(hparams, 'lambda_reversal', 'NOT SET')}")
+        _logger.info(f"  - Accent Adv Max Weight: {getattr(hparams, 'adv_max_weight', 1e-2)}")
+        _logger.info(f"  - Accent Adv Warmup Steps: {getattr(hparams, 'warmup_steps', 10000)}")
+        # Also check if criterion has the expected values
+        _logger.info(f"  - Criterion warmup_steps: {getattr(criterion, 'warmup_steps', 'NOT SET')}")
+        _logger.info(f"  - Criterion adv_max_weight: {getattr(criterion, 'adv_max_weight', 'NOT SET')}")
+    else:
+        _logger.info(f"Accent Encoder: DISABLED (using original ProsodyEncoder)")
         
     _logger.info('**' * 40 + '\n')
 
@@ -444,7 +457,11 @@ def train(gpu, hparams, log_file):
                     
                     # Reconstruct targets (Tuple is immutable)
                     # Keep frames_pitch (targets[5]) as RAW because Pitch Consistency likely expects Raw/Standard matching the Pitch Predictor.
-                    targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
+                    # IMPORTANT: Include speaker_ids (targets[6]) for accent adversarial loss
+                    if len(targets) == 7:
+                        targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5], targets[6])
+                    else:
+                        targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
             
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size
