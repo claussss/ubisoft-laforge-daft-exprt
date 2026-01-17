@@ -298,7 +298,9 @@ def train(gpu, hparams, log_file):
     # should always set the single device scope, otherwise,
     # DistributedDataParallel will use all available devices
     if hparams.multiprocessing_distributed and hparams.device != 'cpu':
-        model = DDP(model, device_ids=[gpu])
+        # find_unused_parameters=True needed for accent transfer components
+        # (SpeakerClassifier outputs may not always contribute to loss)
+        model = DDP(model, device_ids=[gpu], find_unused_parameters=True)
     
     # ---------------------------------------------------------
     # define training loss and optimizer
