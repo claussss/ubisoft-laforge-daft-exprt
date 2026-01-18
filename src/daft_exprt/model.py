@@ -333,38 +333,38 @@ class SpeakerClassifier(nn.Module):
 
 
 class StyleAdapter(nn.Module):
-    """ Style Adapter: Generates FiLM parameters from fused accent+speaker embeddings """
+    """ Style Adapter: Generates FiLM parameters from summed accent+speaker embeddings 
+    
+    Matches original ProsodyEncoder architecture:
+    - Single linear layer for FiLM prediction (not 2-layer MLP)
+    - FiLM conditioning on phoneme_encoder and frame_decoder only (no upsampling)
+    - Input is summed embeddings (accent_emb + spk_emb), not concatenated
+    """
     def __init__(self, hparams):
         super(StyleAdapter, self).__init__()
-        accent_dim = hparams.accent_encoder['hidden_embed_dim']
-        speaker_dim = hparams.phoneme_encoder['hidden_embed_dim']
-        input_dim = accent_dim + speaker_dim
-        hidden_dim = getattr(hparams, 'style_adapter_hidden', 512)
+        # Input is now summed embedding (same dim as each component)
+        input_dim = hparams.accent_encoder['hidden_embed_dim']  # 128, summed
+        self.post_mult_weight = hparams.post_mult_weight
         
-        # Determine decoder hidden dim (accounts for concatenation mode)
+        # Determine decoder hidden dim (accounts for concatenation mode in decoder)
         if getattr(hparams, 'use_concatenation', False):
             decoder_hidden_dim = hparams.phoneme_encoder['hidden_embed_dim'] * 3
         else:
             decoder_hidden_dim = hparams.phoneme_encoder['hidden_embed_dim']
         
+        # Only condition phoneme_encoder and frame_decoder (no upsampling, like original)
         self.module_params = {
             'phoneme_encoder': (hparams.phoneme_encoder['nb_blocks'], hparams.phoneme_encoder['hidden_embed_dim']),
-            'upsampling': (3, hparams.phoneme_encoder['hidden_embed_dim']),
             'frame_decoder': (hparams.frame_decoder['nb_blocks'], decoder_hidden_dim)
         }
         
         nb_tot_film_params = sum(nb_blocks * channels for nb_blocks, channels in self.module_params.values())
         
-        self.gamma_predictor = nn.Sequential(
-            LinearNorm(input_dim, hidden_dim, w_init_gain='relu'), nn.ReLU(),
-            LinearNorm(hidden_dim, nb_tot_film_params, w_init_gain='linear')
-        )
-        self.beta_predictor = nn.Sequential(
-            LinearNorm(input_dim, hidden_dim, w_init_gain='relu'), nn.ReLU(),
-            LinearNorm(hidden_dim, nb_tot_film_params, w_init_gain='linear')
-        )
+        # Single linear layer (like original ProsodyEncoder)
+        self.gammas_predictor = LinearNorm(input_dim, nb_tot_film_params, w_init_gain='linear')
+        self.betas_predictor = LinearNorm(input_dim, nb_tot_film_params, w_init_gain='linear')
         
-        self.post_mult_weight = hparams.post_mult_weight
+        # Initialize L2 penalized scalar post-multipliers
         if self.post_mult_weight > 0:
             nb_post_multipliers = sum(params[0] for params in self.module_params.values())
             self.post_multipliers = Parameter(torch.empty(2, nb_post_multipliers))
@@ -373,8 +373,9 @@ class StyleAdapter(nn.Module):
             self.post_multipliers = 1.0
     
     def forward(self, combined_emb):
-        gammas = self.gamma_predictor(combined_emb)
-        betas = self.beta_predictor(combined_emb)
+        """ Forward pass: combined_emb is summed accent+speaker embedding (B, hidden_dim) """
+        gammas = self.gammas_predictor(combined_emb)  # (B, nb_tot_film_params)
+        betas = self.betas_predictor(combined_emb)    # (B, nb_tot_film_params)
         
         film_params = {}
         column_idx, block_idx = 0, 0
@@ -765,10 +766,10 @@ class DaftExprt(nn.Module):
         # 3. Speaker classification (for adversarial training with GRL)
         spk_preds = self.speaker_classifier(accent_emb)  # (B, n_speakers)
         
-        # 4. Fuse accent + speaker and generate FiLM parameters
-        combined_emb = torch.cat([accent_emb, spk_emb], dim=-1)  # (B, 2*hidden_dim)
+        # 4. Fuse accent + speaker and generate FiLM parameters (SUMMATION like original)
+        combined_emb = accent_emb + spk_emb  # (B, hidden_dim)
         film_params_dict = self.style_adapter(combined_emb)
-        # Returns: {'phoneme_encoder': (B, 4, 256), 'upsampling': (B, 3, 256), 'frame_decoder': (B, 4, 256)}
+        # Returns: {'phoneme_encoder': (B, 4, 256), 'frame_decoder': (B, 4, 256)}
         
         # 5. Encode Phonemes (with accent conditioning)
         x = self.phoneme_encoder(
@@ -778,10 +779,10 @@ class DaftExprt(nn.Module):
         )  # (B, L_max, hidden_embed_dim)
         encoder_outputs = x
         
-        # 6. Gaussian Upsampling (with accent conditioning)
+        # 6. Gaussian Upsampling (no FiLM, explicit prosody only)
         x, weights = self.gaussian_upsampling(
             x, durations_float, durations_int, symbols_energy, symbols_pitch, input_lengths,
-            film_params=film_params_dict['upsampling']
+            film_params=None  # No FiLM on upsampling, like original
         )  # (B, T_max, hidden_embed_dim)
         
         # 7. Frame Decoder (with accent conditioning)
@@ -878,27 +879,67 @@ class DaftExprt(nn.Module):
         return pitch_preds
     
     def inference(self, inputs, pitch_transform, hparams, external_prosody=None,
-                  neutralize_prosody=False, neutralize_speaker_encoder=False, external_embeddings=None):
+                  neutralize_prosody=False, neutralize_speaker_encoder=False, 
+                  external_embeddings=None, external_accent_emb=None):
         ''' Inference function of DaftExprt
+        
+        Args:
+            inputs: tuple of (symbols, dur_factors, energy_factors, pitch_factors, input_lengths,
+                    energy_refs, pitch_refs, mel_spec_refs, ref_lengths, speaker_ids)
+            pitch_transform: 'add' or 'multiply'
+            hparams: hyperparameters
+            external_prosody: dict with duration_preds, durations_int, energy_preds, pitch_preds
+            neutralize_prosody: zero out the accent embedding
+            neutralize_speaker_encoder: zero out speaker embedding for phoneme encoder
+            external_embeddings: pre-computed speaker embedding (B, external_emb_dim)
+            external_accent_emb: pre-computed accent embedding (B, hidden_embed_dim) - if None, extract from mel_spec_refs
         '''
-        # symbols = (B, L_max)
-        # dur_factors = (B, L_max)
-        # energy_factors = (B, L_max)
-        # pitch_factors = (B, L_max)
-        # input_lengths = (B, )
-        # energy_refs = (B, T_max)
-        # pitch_refs = (B, T_max)
-        # mel_spec_refs = (B, n_mel_channels, T_max)
-        # ref_lengths = (B, )
-        # speaker_ids = (B, )
+        # Unpack inputs
         symbols, dur_factors, energy_factors, pitch_factors, input_lengths, \
             energy_refs, pitch_refs, mel_spec_refs, ref_lengths, speaker_ids = inputs
         
-        # 1. Encode Phonemes (No speaker conditioning)
-        # Pass None for film_params
-        enc_outputs = self.phoneme_encoder(symbols, None, input_lengths)  # (B, L_max, hidden_embed_dim)
+        # 1. Get Speaker Embedding
+        if self.use_external_embeddings:
+            if external_embeddings is None:
+                raise ValueError("Model requires external_embeddings for inference in this mode.")
+            spk_emb = torch.nn.functional.normalize(external_embeddings, p=2, dim=-1)
+            spk_emb = self.spk_projection(spk_emb)
+        else:
+            spk_emb = self.spk_embedding(speaker_ids)  # (B, hidden_embed_dim)
         
-        # 2. Get Prosody (Must be provided externally as predictor is removed)
+        # 2. Get Accent Embedding (from reference mel-spec or external)
+        if hasattr(self, 'accent_encoder') and self.accent_encoder is not None:
+            if external_accent_emb is not None:
+                # Use pre-computed accent embedding
+                accent_emb = external_accent_emb
+            else:
+                # Extract from reference mel-spec (self-reference or cross-reference)
+                accent_emb = self.accent_encoder(
+                    energy_refs, pitch_refs, mel_spec_refs, ref_lengths
+                )  # (B, hidden_embed_dim)
+            
+            if neutralize_prosody:
+                accent_emb = torch.zeros_like(accent_emb)
+            
+            # 3. Generate FiLM parameters using StyleAdapter (SUMMATION like original)
+            combined_emb = accent_emb + spk_emb  # (B, hidden_dim)
+            film_params_dict = self.style_adapter(combined_emb)
+            # Returns: {'phoneme_encoder': (B, 4, 256), 'frame_decoder': (B, 4, 256)}
+        else:
+            # Fallback to old behavior (no accent encoder)
+            film_params_dict = {
+                'phoneme_encoder': None,
+                'frame_decoder': None
+            }
+        
+        # 4. Encode Phonemes (with accent FiLM conditioning)
+        enc_outputs = self.phoneme_encoder(
+            symbols, 
+            film_params_dict['phoneme_encoder'], 
+            input_lengths
+        )  # (B, L_max, hidden_embed_dim)
+        
+        # 5. Get Prosody (Must be provided externally as predictor is removed)
         if external_prosody is None:
             raise ValueError("external_prosody must be provided for inference as the internal predictor has been removed.")
         
@@ -908,24 +949,14 @@ class DaftExprt(nn.Module):
         pitch_preds = external_prosody['pitch_preds']
         
         # Apply factors
-        # multiply durations by duration factors and extract int durations
-        duration_preds *= dur_factors  # (B, L_max)
+        duration_preds = duration_preds * dur_factors  # (B, L_max)
         duration_preds, durations_int = self.get_int_durations(duration_preds, hparams)  # (B, L_max)
         
-        energy_preds *= energy_factors
-        # external values are already normalized, so only enforce masking
+        energy_preds = energy_preds * energy_factors
+        # Enforce masking
         energy_preds[durations_int == 0] = 0.
         pitch_preds[durations_int == 0] = 0.
-
         
-        # Note: pitch_shift and pitch_multiply logic depends on stats.
-        # If we use external normalization (dynamic stats), the `hparams.stats` looked up inside 
-        # these functions might be invalid or mismatched if they rely on static ID-based lookup.
-        # However, for now we assume pitch_transform is typically 'add' doing nothing or simple shift.
-        # Given "no code edits" scope limitation of the request in some contexts, we are editing code here.
-        # We should probably update pitch_shift to accept stats explicitly, but for now let's keep it as is
-        # and assume the user understands pitch shifting limitations with dynamic stats.
-
         if pitch_transform == 'add':
             pitch_preds = self.pitch_shift(pitch_preds, pitch_factors, hparams, speaker_ids)
         elif pitch_transform == 'multiply':
@@ -933,55 +964,30 @@ class DaftExprt(nn.Module):
         else:
             raise NotImplementedError
         
-        # 3. Gaussian Upsampling
-        # symbols_upsamp = (B, T_max, hidden_embed_dim)
-        # weights = (B, L_max, T_max)
-        symbols_upsamp, weights = self.gaussian_upsampling(enc_outputs, duration_preds, durations_int, energy_preds, pitch_preds, input_lengths)
+        # 6. Gaussian Upsampling (no FiLM, explicit prosody only)
+        symbols_upsamp, weights = self.gaussian_upsampling(
+            enc_outputs, duration_preds, durations_int, energy_preds, pitch_preds, input_lengths,
+            film_params=None  # No FiLM on upsampling, like original
+        )  # (B, T_max, hidden_embed_dim), (B, L_max, T_max)
         
-        # get sequence output length for each element in the batch
-        # Fix possible scalar output if batch size is 1
+        # Get sequence output lengths
         output_lengths = torch.sum(durations_int, dim=1)  # (B, )
-        output_lengths = output_lengths.to(symbols_upsamp.device, non_blocking=True).long()  # (B, )
-        # Safety check: if output_length is 0, set to 1 to avoid crash
-        output_lengths[output_lengths == 0] = 1
+        output_lengths = output_lengths.to(symbols_upsamp.device, non_blocking=True).long()
+        output_lengths[output_lengths == 0] = 1  # Safety check
         
         assert(torch.max(output_lengths) == symbols_upsamp.size(1))
         
-        # 4. Frame Decoder (Conditioned on Speaker Embedding)
-        # Get speaker embedding
-        if self.use_external_embeddings:
-            if external_embeddings is None:
-                 raise ValueError("Model requires external_embeddings for inference in this mode.")
-            
-            # Normalize and project
-            spk_emb = torch.nn.functional.normalize(external_embeddings, p=2, dim=-1)
-            # Always project
-            spk_emb = self.spk_projection(spk_emb)
-        else:
-            spk_emb = self.spk_embedding(speaker_ids) # (B, hidden_embed_dim)
+        # 7. Frame Decoder (with accent FiLM conditioning)
+        mel_spec_preds = self.frame_decoder(
+            symbols_upsamp, 
+            film_params_dict['frame_decoder'], 
+            output_lengths
+        )  # (B, n_mel_channels, T_max)
         
-        # Generate FiLM params
-        gammas = self.gammas_predictor(spk_emb) # (B, nb_decoder_film_params // 2)
-        betas = self.betas_predictor(spk_emb)   # (B, nb_decoder_film_params // 2)
-        
-        # Reshape for Decoder: (B, nb_blocks, nb_film_params_per_block)
-        B = spk_emb.size(0)
-        nb_blocks = self.frame_decoder.blocks.__len__()
-        
-        gammas = gammas.view(B, nb_blocks, -1)
-        betas = betas.view(B, nb_blocks, -1)
-        
-        # Apply "delta regime"
-        gammas = gammas + 1
-        
-        decoder_film = torch.cat((gammas, betas), dim=2) # (B, nb_blocks, 2 * decoder_hidden_dim)
-        
-        # Decode output sequence and predict mel-specs
-        mel_spec_preds = self.frame_decoder(symbols_upsamp, decoder_film, output_lengths)  # (B, nb_mels, T_max)
-        
-        # parse outputs
+        # Parse outputs
         encoder_preds = [duration_preds, durations_int, energy_preds, pitch_preds, input_lengths]
         decoder_preds = [mel_spec_preds, output_lengths]
         alignments = weights
         
         return encoder_preds, decoder_preds, alignments
+

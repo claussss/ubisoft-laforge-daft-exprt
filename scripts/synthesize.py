@@ -405,6 +405,52 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
     batch_ext_embs = None
     if external_embeddings is not None:
         batch_ext_embs = external_embeddings.repeat(len(sentences), 1)
+    
+    # Extract accent embeddings if directory is provided
+    external_accent_emb = None
+    accent_emb_dir = getattr(args, 'accent_emb_audios_dir', None)
+    if accent_emb_dir and os.path.isdir(accent_emb_dir):
+        _logger.info(f"Computing accent embedding from directory: {accent_emb_dir}")
+        wav_files = [os.path.join(accent_emb_dir, f) for f in os.listdir(accent_emb_dir) if f.endswith('.wav')]
+        if not wav_files:
+            raise ValueError(f"No .wav files found in {accent_emb_dir}")
+        
+        # Extract features from each wav file and compute accent embedding
+        all_accent_embs = []
+        for wav_path in wav_files:
+            wav, sr = librosa.load(wav_path, sr=hparams.sampling_rate)
+            wav = rescale_wav_to_float32(wav)
+            # Extract mel, pitch, energy
+            mel = mel_spectrogram_HiFi(wav, hparams)
+            pitch = extract_pitch(wav, sr, hparams)
+            energy = compute_energy_frames(np.exp(mel))
+            # Align lengths
+            min_len = min(len(pitch), len(energy), mel.shape[1])
+            pitch, energy, mel = pitch[:min_len], energy[:min_len], mel[:, :min_len]
+            # Convert to tensors
+            pitch_t = torch.from_numpy(pitch).float().unsqueeze(0).to(device)  # (1, T)
+            energy_t = torch.from_numpy(energy).float().unsqueeze(0).to(device)  # (1, T)
+            mel_t = torch.from_numpy(mel).float().unsqueeze(0).to(device)  # (1, n_mels, T)
+            length_t = torch.tensor([min_len], dtype=torch.long, device=device)
+            # Extract accent embedding using model's accent encoder
+            with torch.no_grad():
+                if hasattr(model, 'accent_encoder') and model.accent_encoder is not None:
+                    accent_emb = model.accent_encoder(energy_t, pitch_t, mel_t, length_t)
+                    all_accent_embs.append(accent_emb.cpu())
+                else:
+                    _logger.warning("Model does not have accent_encoder, skipping accent embedding extraction.")
+                    break
+        
+        if all_accent_embs:
+            # Average all accent embeddings
+            avg_accent_emb = torch.mean(torch.stack(all_accent_embs), dim=0)
+            external_accent_emb = avg_accent_emb.to(device)  # (1, hidden_dim)
+            _logger.info(f"Computed average accent embedding from {len(wav_files)} files. Shape: {external_accent_emb.shape}")
+    
+    # Expand accent embedding to batch size
+    batch_accent_embs = None
+    if external_accent_emb is not None:
+        batch_accent_embs = external_accent_emb.repeat(len(sentences), 1)
         
     # generate mel-specs and synthesize audios with Griffin-Lim
     predictions = generate_mel_specs(model, sentences, file_names, speaker_ids, refs, args.output_dir,
@@ -414,7 +460,7 @@ def synthesize(args, dur_factor=None, energy_factor=None, pitch_factor=None,
                        neutralize_prosody=args.neutralize_prosody,
                        neutralize_speaker_encoder=args.neutralize_speaker_encoder,
                        alpha_dur=args.alpha_dur, alpha_pitch=args.alpha_pitch, alpha_energy=args.alpha_energy,
-                       external_embeddings=batch_ext_embs)
+                       external_embeddings=batch_ext_embs, external_accent_emb=batch_accent_embs)
     compare_paths = None
     if args.plot_prosody_files_to_compare:
         compare_paths = _load_manifest(os.path.abspath(args.plot_prosody_files_to_compare), len(sentences), split_text=True)
@@ -637,6 +683,8 @@ if __name__ == '__main__':
                         help='Energy exaggeration factor (variance scaling). Default 1.0 (no change).')
     parser.add_argument('--spk_emb_audios_dir', type=str, default='',
                         help='Directory containing .wav files to compute average speaker embedding for zero-shot conditioning.')
+    parser.add_argument('--accent_emb_audios_dir', type=str, default='',
+                        help='Directory containing .wav files to compute average accent embedding for accent transfer.')
     
     args = parser.parse_args()
     

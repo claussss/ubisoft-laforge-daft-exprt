@@ -294,7 +294,8 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
                              n_jobs, use_griffin_lim=True, batch_external_prosody=None,
                              vocoder=None, source_stats=None, reduce_buzz=False,
                              neutralize_prosody=False, neutralize_speaker_encoder=False,
-                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0, external_embeddings=None):
+                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0, 
+                             external_embeddings=None, external_accent_emb=None):
     ''' Generate batch mel-specs using Daft-Exprt
     '''
     # add speaker info to file name
@@ -397,7 +398,8 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
         inputs, pitch_transform, hparams, external_tensors,
         neutralize_prosody=neutralize_prosody,
         neutralize_speaker_encoder=neutralize_speaker_encoder,
-        external_embeddings=external_embeddings
+        external_embeddings=external_embeddings,
+        external_accent_emb=external_accent_emb
     )
     # parse outputs
     duration_preds, durations_int, energy_preds, pitch_preds, input_lengths = encoder_preds
@@ -453,7 +455,8 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
                        n_jobs=1, use_griffin_lim=False, get_time_perf=False, external_prosody=None,
                        vocoder=None, source_stats=None, reduce_buzz=False,
                        neutralize_prosody=False, neutralize_speaker_encoder=False,
-                       alpha_dur=None, alpha_pitch=None, alpha_energy=None, external_embeddings=None):
+                       alpha_dur=None, alpha_pitch=None, alpha_energy=None, 
+                       external_embeddings=None, external_accent_emb=None):
     ''' Generate mel-specs using Daft-Exprt
 
         sentences = [
@@ -556,6 +559,11 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
         external_embeddings_chunks = list(chunker(external_embeddings, batch_size))
     else:
         external_embeddings_chunks = [None] * len(sentence_chunks)
+    
+    if external_accent_emb is not None:
+        external_accent_chunks = list(chunker(external_accent_emb, batch_size))
+    else:
+        external_accent_chunks = [None] * len(sentence_chunks)
 
     with torch.no_grad():
         for idx in range(len(sentence_chunks)):
@@ -568,6 +576,7 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
             batch_file_names = file_chunks[idx]
             batch_external = external_chunks[idx] if external_chunks[idx] is not None else None
             batch_external_embeddings = external_embeddings_chunks[idx] if external_embeddings_chunks[idx] is not None else None
+            batch_accent_emb = external_accent_chunks[idx] if external_accent_chunks[idx] is not None else None
 
             sentence_begin = time.time() if get_time_perf else None
             batch_predictions =  generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_factors,
@@ -578,7 +587,8 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
                                                               neutralize_prosody=neutralize_prosody,
                                                               neutralize_speaker_encoder=neutralize_speaker_encoder,
                                                               alpha_dur=alpha_dur, alpha_pitch=alpha_pitch, alpha_energy=alpha_energy,
-                                                              external_embeddings=batch_external_embeddings)
+                                                              external_embeddings=batch_external_embeddings,
+                                                              external_accent_emb=batch_accent_emb)
             predictions.update(batch_predictions)
             time_per_batch += [time.time() - sentence_begin] if get_time_perf else []
     
