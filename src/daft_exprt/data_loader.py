@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 
@@ -6,6 +7,9 @@ import torch
 
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+
+
+_logger = logging.getLogger(__name__)
 
 
 class DaftExprtDataLoader(Dataset):
@@ -135,7 +139,18 @@ class DaftExprtDataLoader(Dataset):
             frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file
     
     def __getitem__(self, index):
-        return self.get_data(self.data[index])
+        try:
+            return self.get_data(self.data[index])
+        except Exception as e:
+            # Log the corrupted file and return a random valid sample
+            features_dir = self.data[index][0]
+            feature_file = self.data[index][1]
+            _logger.warning(f"Skipping corrupted file: {features_dir}/{feature_file} - Error: {e}")
+            # Return a random different sample
+            new_index = random.randint(0, len(self.data) - 1)
+            while new_index == index:
+                new_index = random.randint(0, len(self.data) - 1)
+            return self.__getitem__(new_index)
 
     def __len__(self):
         return len(self.data)
