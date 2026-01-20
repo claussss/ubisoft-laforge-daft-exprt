@@ -30,7 +30,6 @@ from daft_exprt.logger import DaftExprtLogger
 from daft_exprt.loss import DaftExprtLoss
 from daft_exprt.model import DaftExprt
 from daft_exprt.utils import get_nb_jobs
-from daft_exprt.dynamic_stats import DynamicSpeakerStatsManager
 
 
 _logger = logging.getLogger(__name__)
@@ -210,9 +209,9 @@ def validate(gpu, model, criterion, val_loader, hparams):
     # initialize variables
     val_loss = 0.
     val_indiv_loss = {
-        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-        'adv_loss': 0., 'energy_consistency_loss': 0.,
-        'pitch_consistency_loss': 0., 'accent_adv_loss': 0.
+        'speaker_loss': 0., 'post_mult_loss': 0.,
+        'duration_loss': 0., 'energy_loss': 0., 'pitch_loss': 0.,
+        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
     }
     val_targets, val_outputs = [], []
     
@@ -230,8 +229,9 @@ def validate(gpu, model, criterion, val_loader, hparams):
             val_targets.append(targets)
             val_outputs.append(outputs)
             val_loss += loss.item()
-            for key in val_indiv_loss:
-                val_indiv_loss[key] += individual_loss[key]
+            for key in individual_loss:
+                if key in val_indiv_loss:
+                    val_indiv_loss[key] += individual_loss[key]
         # normalize losses
         val_loss = val_loss / (i + 1)
         for key in val_indiv_loss:
@@ -361,35 +361,7 @@ def train(gpu, hparams, log_file):
     _logger.info(f"  - Max LR: {hparams.max_learning_rate}")
     _logger.info(f"  - Warmup Steps: {hparams.warmup_steps}")
     
-    # Dynamic Stats Info
-    if getattr(hparams, 'use_external_embeddings', False):
-        _logger.info(f"Dynamic Stats: ENABLED")
-        _logger.info(f"  - Subset Size: {getattr(hparams, 'dynamic_stats_subset_size', 10)}")
-        _logger.info(f"  - Refresh Interval: {getattr(hparams, 'stats_refresh_interval', 100)}")
-        _logger.info(f"  - External Emb Dim: {getattr(hparams, 'external_emb_dim', 192)}")
-    else:
-        _logger.info(f"Dynamic Stats: DISABLED")
-    
-    # Accent Encoder Config (NEW)
-    if hasattr(hparams, 'accent_encoder'):
-        _logger.info(f"Accent Encoder: ENABLED")
-        _logger.info(f"  - Config: {hparams.accent_encoder}")
-        _logger.info(f"  - Lambda Reversal (GRL): {getattr(hparams, 'lambda_reversal', 'NOT SET')}")
-        _logger.info(f"  - Accent Adv Max Weight: {getattr(hparams, 'adv_max_weight', 1e-2)}")
-        _logger.info(f"  - Accent Adv Warmup Steps: {getattr(hparams, 'warmup_steps', 10000)}")
-        # Also check if criterion has the expected values
-        _logger.info(f"  - Criterion warmup_steps: {getattr(criterion, 'warmup_steps', 'NOT SET')}")
-        _logger.info(f"  - Criterion adv_max_weight: {getattr(criterion, 'adv_max_weight', 'NOT SET')}")
-    else:
-        _logger.info(f"Accent Encoder: DISABLED (using original ProsodyEncoder)")
-        
     _logger.info('**' * 40 + '\n')
-
-    # Initialize Dynamic Stats Manager placeholders
-    use_external_embeddings = getattr(hparams, 'use_external_embeddings', False)
-    stats_manager = None
-    if use_external_embeddings:
-        stats_refresh_interval = getattr(hparams, 'stats_refresh_interval', 100) # steps
 
     # =========================================================
     #                   MAIN TRAINING LOOP
@@ -397,10 +369,9 @@ def train(gpu, hparams, log_file):
     # set variables
     tot_loss = 0.
     indiv_loss = {
-        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-        'adv_loss': 0., 'energy_consistency_loss': 0.,
-        'pitch_consistency_loss': 0.,
-        'accent_adv_loss': 0 # NEW: Accent adversarial loss
+        'speaker_loss': 0., 'post_mult_loss': 0.,
+        'duration_loss': 0., 'energy_loss': 0., 'pitch_loss': 0.,
+        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
     }
     total_time = 0.
     start = time.time()
@@ -426,42 +397,6 @@ def train(gpu, hparams, log_file):
                 inputs, targets = model.module.parse_batch(hparams.device, batch)
             else:
                 inputs, targets = model.parse_batch(hparams.device, batch)
-                
-            # Dynamic Stats Update and Processing
-            if use_external_embeddings:
-                if stats_manager is None:
-                     _logger.info("Initializing Dynamic Speaker Stats Manager (Lazy)...")
-                     _logger.info(">> DYNAMIC STATS ENABLED: Overriding static 'stats.json'. Data loader returns raw values; Normalization happens on-the-fly using random subsets.")
-                     stats_manager = DynamicSpeakerStatsManager(hparams)
-
-                if stats_manager is not None:
-                    # Refresh periodically
-                    if iteration % stats_refresh_interval == 0:
-                         stats_manager.refresh_stats()
-                         
-                    # Apply stats normalization and inject avg embedding
-                    # We need to pass device to ensure tensors are on GPU
-                    inputs = stats_manager.process_batch(inputs, hparams.device)
-                    
-                    # CRITICAL FIX: Ensure targets used for loss are ALSO normalized.
-                    # stats_manager only processes 'inputs'. 'targets' (created earlier) still hold RAW values.
-                    # We must update 'targets' with the normalized symbols_energy/pitch from 'inputs'
-                    # to ensure the Adversary targets Normalized Prosody (not Raw).
-                    
-                    # inputs structure: (symbols, durations_float, durations_int, symbols_energy, symbols_pitch, ...)
-                    # targets structure: (durations_float, symbols_energy, symbols_pitch, mel_specs, output_lengths, frames_pitch)
-                    
-                    # Extract normalized values from processed inputs
-                    norm_symbols_energy = inputs[3]
-                    norm_symbols_pitch = inputs[4]
-                    
-                    # Reconstruct targets (Tuple is immutable)
-                    # Keep frames_pitch (targets[5]) as RAW because Pitch Consistency likely expects Raw/Standard matching the Pitch Predictor.
-                    # IMPORTANT: Include speaker_ids (targets[6]) for accent adversarial loss
-                    if len(targets) == 7:
-                        targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5], targets[6])
-                    else:
-                        targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
             
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size
@@ -472,7 +407,8 @@ def train(gpu, hparams, log_file):
             for key in individual_loss:
                 # individual losses are already detached from the graph
                 # individual_loss / (batch_size * accumulation_steps)
-                indiv_loss[key] += individual_loss[key] / hparams.accumulation_steps
+                if key in indiv_loss:
+                    indiv_loss[key] += individual_loss[key] / hparams.accumulation_steps
 
             # ---------------------------------------------------------
             # backward pass
@@ -521,6 +457,9 @@ def train(gpu, hparams, log_file):
                     if hparams.rank == 0:
                         # display remaining time
                         _logger.info(f"Validation loss {iteration}: {val_loss:.6f} ")
+                        # Log individual validation loss components
+                        val_loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in val_indiv_loss.items() if v > 0])
+                        _logger.info(f"Val loss breakdown: {val_loss_str}")
                         _logger.info("estimated required time = {0.days:02}:{0.hours:02}:{0.minutes:02}:{0.seconds:02}".
                                      format(relativedelta(seconds=int((hparams.nb_iterations - iteration) *
                                             (total_time / hparams.iters_check_for_model_improvement)))))
@@ -566,9 +505,9 @@ def train(gpu, hparams, log_file):
                 iteration += 1
                 tot_loss = 0.
                 indiv_loss = {
-                    'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-                    'adv_loss': 0., 'energy_consistency_loss': 0.,
-                    'pitch_consistency_loss': 0., 'accent_adv_loss': 0.
+                    'speaker_loss': 0., 'post_mult_loss': 0.,
+                    'duration_loss': 0., 'energy_loss': 0., 'pitch_loss': 0.,
+                    'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
                 }
                 start = time.time()
                 accumulation_step = 0
