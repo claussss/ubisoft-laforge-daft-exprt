@@ -30,3 +30,10 @@ config.json
 config_adv.json
 *.pt
 train_pitch_predictor.slurm
+train_logs_to_compare/
+*.log
+*.txt
+*.csv
+old_code/
+pretrained_models/
+scripts/evaluation/NISQA/

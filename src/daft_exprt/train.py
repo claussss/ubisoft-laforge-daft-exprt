@@ -1,3 +1,8 @@
+import os
+# Limit OpenMP/MKL threads before native libs load to avoid "Leaking Caffe2 thread-pool after fork" in DataLoader workers
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+
 import matplotlib
 matplotlib.use('Agg')
 
@@ -5,11 +10,11 @@ import argparse
 import json
 import logging
 import math
-import os
 import random
 import time
 
 import torch
+torch.set_num_threads(1)
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import PIL.Image
@@ -17,19 +22,18 @@ if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
 from dateutil.relativedelta import relativedelta
-from shutil import copyfile
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 
 from daft_exprt.data_loader import prepare_data_loaders
 from daft_exprt.extract_features import FEATURES_HPARAMS, check_features_config_used
-from daft_exprt.generate import extract_reference_parameters, prepare_sentences_for_inference, generate_mel_specs
 from daft_exprt.hparams import HyperParams
 from daft_exprt.logger import DaftExprtLogger
 from daft_exprt.loss import DaftExprtLoss
 from daft_exprt.model import DaftExprt
 from daft_exprt.utils import get_nb_jobs
+from daft_exprt.dynamic_stats import DynamicSpeakerStatsManager
 
 
 _logger = logging.getLogger(__name__)
@@ -156,45 +160,6 @@ def update_learning_rate(hparams, iteration):
     return learning_rate
 
 
-def generate_benchmark_sentences(model, hparams, output_dir):
-    ''' Generate benchmark sentences using Daft-Exprt model
-    
-    :param model:           model to use for synthesis
-    :param hparams:         hyper-params used for training/synthesis
-    :param output_dir:      directory to store synthesized files
-    '''
-    # set random speaker id
-    speaker_id = random.choice(hparams.speakers_id)
-    # choose reference for style transfer
-    with open(hparams.validation_files, 'r', encoding='utf-8') as f:
-        references = [line.strip().split('|') for line in f]
-    reference = random.choice(references)
-    reference_path, file_name = reference[0], reference[1]
-    speaker_name = [speaker for speaker in hparams.speakers if reference_path.endswith(speaker)][0]
-    audio_ref = f'{os.path.join(hparams.data_set_dir, speaker_name, "wavs", file_name)}.wav'
-    # display info
-    _logger.info('\nGenerating benchmark sentences with the following parameters:')
-    _logger.info(f'speaker_id = {speaker_id}')
-    _logger.info(f'audio_ref = {audio_ref}\n')
-    
-    # prepare benchmark sentences
-    n_jobs = get_nb_jobs('max')
-    text_file = os.path.join(hparams.benchmark_dir, hparams.language, 'sentences.txt')
-    sentences, file_names = \
-        prepare_sentences_for_inference(text_file, output_dir, hparams, n_jobs)
-    # extract reference prosody parameters
-    extract_reference_parameters(audio_ref, output_dir, hparams)
-    # duplicate reference parameters
-    file_name = os.path.basename(audio_ref).replace('.wav', '')
-    refs = [os.path.join(output_dir, f'{file_name}.npz') for _ in range(len(sentences))]
-    # generate mel_specs and audios with Griffin-Lim
-    speaker_ids = [speaker_id for _ in range(len(sentences))]
-    generate_mel_specs(model, sentences, file_names, speaker_ids, refs,
-                       output_dir, hparams, use_griffin_lim=True)
-    # copy audio ref
-    copyfile(audio_ref, os.path.join(output_dir, f'{file_name}.wav'))
-
-
 def validate(gpu, model, criterion, val_loader, hparams):
     ''' Handles all the validation scoring and printing
 
@@ -209,9 +174,8 @@ def validate(gpu, model, criterion, val_loader, hparams):
     # initialize variables
     val_loss = 0.
     val_indiv_loss = {
-        'speaker_loss': 0., 'post_mult_loss': 0.,
-        'duration_loss': 0., 'energy_loss': 0., 'pitch_loss': 0.,
-        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
+        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
+        'speaker_loss': 0., 'post_mult_loss': 0.
     }
     val_targets, val_outputs = [], []
     
@@ -229,9 +193,8 @@ def validate(gpu, model, criterion, val_loader, hparams):
             val_targets.append(targets)
             val_outputs.append(outputs)
             val_loss += loss.item()
-            for key in individual_loss:
-                if key in val_indiv_loss:
-                    val_indiv_loss[key] += individual_loss[key]
+            for key in val_indiv_loss:
+                val_indiv_loss[key] += individual_loss[key]
         # normalize losses
         val_loss = val_loss / (i + 1)
         for key in val_indiv_loss:
@@ -337,8 +300,14 @@ def train(gpu, hparams, log_file):
     # ---------------------------------------------------------
     # display training info
     # ---------------------------------------------------------
+    nb_batches_per_epoch = len(train_loader)
+    if nb_batches_per_epoch == 0:
+        raise RuntimeError(
+            f"Train DataLoader has 0 batches (examples={nb_training_examples}, batch_size={hparams.batch_size}, drop_last=True). "
+            "Reduce batch_size or add more data so at least one batch is produced per epoch."
+        )
     # compute the number of epochs
-    nb_iterations_per_epoch = int(len(train_loader) / hparams.accumulation_steps)
+    nb_iterations_per_epoch = int(nb_batches_per_epoch / hparams.accumulation_steps)
     nb_iterations_per_epoch = max(1, nb_iterations_per_epoch)
     epoch_offset = max(0, int(iteration / nb_iterations_per_epoch))
     epochs = int(hparams.nb_iterations / nb_iterations_per_epoch) + 1
@@ -346,6 +315,7 @@ def train(gpu, hparams, log_file):
     _logger.info('**' * 40)
     _logger.info(f"Batch size: {hparams.batch_size * hparams.accumulation_steps * hparams.world_size:_}")
     _logger.info(f"Nb examples: {nb_training_examples:_}")
+    _logger.info(f"Nb batches per epoch: {nb_batches_per_epoch:_}")
     _logger.info(f"Nb iterations per epoch: {nb_iterations_per_epoch:_}")
     _logger.info(f"Nb total of epochs: {epochs:_}")
     _logger.info(f"Started at epoch: {epoch_offset:_}")
@@ -361,7 +331,29 @@ def train(gpu, hparams, log_file):
     _logger.info(f"  - Max LR: {hparams.max_learning_rate}")
     _logger.info(f"  - Warmup Steps: {hparams.warmup_steps}")
     
+    # ECAPA speaker embeddings: dynamic stats always used with precomputed spk_embs
+    _logger.info(f"Dynamic Stats: ENABLED (ECAPA spk_embs required)")
+    _logger.info(f"  - Subset Size: {getattr(hparams, 'dynamic_stats_subset_size', 10)}")
+    _logger.info(f"  - Refresh Interval: {getattr(hparams, 'stats_refresh_interval', 100)}")
+    _logger.info(f"  - External Emb Dim: {getattr(hparams, 'external_emb_dim', 192)}")
+    
+    # Accent Encoder Config (NEW)
+    if hasattr(hparams, 'accent_encoder'):
+        _logger.info(f"Accent Encoder: ENABLED")
+        _logger.info(f"  - Config: {hparams.accent_encoder}")
+        _logger.info(f"  - Lambda Reversal (GRL): {getattr(hparams, 'lambda_reversal', 'NOT SET')}")
+        _logger.info(f"  - Accent Adv Max Weight: {getattr(hparams, 'adv_max_weight', 1e-2)}")
+        _logger.info(f"  - Accent Adv Warmup Steps: {getattr(hparams, 'warmup_steps', 10000)}")
+        # Also check if criterion has the expected values
+        _logger.info(f"  - Criterion warmup_steps: {getattr(criterion, 'warmup_steps', 'NOT SET')}")
+        _logger.info(f"  - Criterion adv_max_weight: {getattr(criterion, 'adv_max_weight', 'NOT SET')}")
+    else:
+        _logger.info(f"Accent Encoder: DISABLED (using original ProsodyEncoder)")
+        
     _logger.info('**' * 40 + '\n')
+
+    stats_manager = None
+    stats_refresh_interval = getattr(hparams, 'stats_refresh_interval', 100)
 
     # =========================================================
     #                   MAIN TRAINING LOOP
@@ -369,9 +361,8 @@ def train(gpu, hparams, log_file):
     # set variables
     tot_loss = 0.
     indiv_loss = {
-        'speaker_loss': 0., 'post_mult_loss': 0.,
-        'duration_loss': 0., 'energy_loss': 0., 'pitch_loss': 0.,
-        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
+        'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
+        'speaker_loss': 0., 'post_mult_loss': 0.
     }
     total_time = 0.
     start = time.time()
@@ -397,7 +388,22 @@ def train(gpu, hparams, log_file):
                 inputs, targets = model.module.parse_batch(hparams.device, batch)
             else:
                 inputs, targets = model.parse_batch(hparams.device, batch)
-            
+                
+            # Dynamic stats: normalize prosody on-the-fly (ECAPA path)
+            if stats_manager is None:
+                _logger.info("Initializing Dynamic Speaker Stats Manager (Lazy)...")
+                _logger.info(">> DYNAMIC STATS ENABLED: Normalization on-the-fly using random subsets.")
+                stats_manager = DynamicSpeakerStatsManager(hparams)
+
+            if iteration % stats_refresh_interval == 0:
+                stats_manager.refresh_stats()
+            inputs = stats_manager.process_batch(inputs, hparams.device)
+
+            # Sync normalized prosody into targets for loss (targets: dur, energy, pitch, mel, out_len, speaker_ids)
+            norm_symbols_energy = inputs[3]
+            norm_symbols_pitch = inputs[4]
+            targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
+
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size
             loss = loss / hparams.accumulation_steps  # loss / (batch_size * accumulation_steps)
@@ -407,14 +413,18 @@ def train(gpu, hparams, log_file):
             for key in individual_loss:
                 # individual losses are already detached from the graph
                 # individual_loss / (batch_size * accumulation_steps)
-                if key in indiv_loss:
-                    indiv_loss[key] += individual_loss[key] / hparams.accumulation_steps
+                indiv_loss[key] += individual_loss[key] / hparams.accumulation_steps
 
             # ---------------------------------------------------------
             # backward pass
             # ---------------------------------------------------------
             loss.backward()
             accumulation_step += 1
+
+            # Log per-step (per-batch) loss and breakdown so output appears every step between epochs
+            if hparams.rank == 0 and not math.isnan(tot_loss):
+                step_loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in indiv_loss.items() if v > 0])
+                _logger.info(f'  Step loss (accu {accumulation_step}/{hparams.accumulation_steps}): {tot_loss:.6f} — {step_loss_str}')
 
             # ---------------------------------------------------------
             # accumulate gradient
@@ -438,8 +448,10 @@ def train(gpu, hparams, log_file):
                         # display iteration stats
                         duration = time.time() - start
                         total_time += duration
+                        train_loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in indiv_loss.items() if v > 0])
                         _logger.info(f'Train loss [{iteration}]: {tot_loss:.6f} Grad Norm {grad_norm:.6f} '
                                     f'{duration:.2f}s/it (LR {learning_rate:.6f})')
+                        _logger.info(f'  Train loss breakdown: {train_loss_str}')
                         # update tensorboard logging
                         tensorboard_logger.log_training(tot_loss, indiv_loss, grad_norm,
                                                         learning_rate, duration, iteration)
@@ -471,15 +483,12 @@ def train(gpu, hparams, log_file):
                         # save as the best model
                         if val_loss < best_val_loss:
                             # update validation loss
-                            _logger.info('Congrats!!! A new best model. You are the best!')
+                            _logger.info('New best validation loss; saving checkpoint.')
                             best_val_loss = val_loss
                             # save checkpoint and generate benchmark sentences
                             checkpoint_path = os.path.join(hparams.output_directory, 'checkpoints', 'DaftExprt_best')
                             save_checkpoint(model, optimizer, hparams, learning_rate,
                                             iteration, best_val_loss, checkpoint_path)
-                            output_dir = os.path.join(hparams.output_directory, 'checkpoints', 'best_checkpoint')
-                            # generate_benchmark_sentences(model, hparams, output_dir)
-                            _logger.info("Skipping benchmark generation as prosody predictor is removed.")
                     # barrier for distributed processes
                     if hparams.multiprocessing_distributed:
                         dist.barrier()
@@ -492,9 +501,6 @@ def train(gpu, hparams, log_file):
                         checkpoint_path = os.path.join(hparams.output_directory, 'checkpoints', f'DaftExprt_{iteration}')
                         save_checkpoint(model, optimizer, hparams, learning_rate,
                                         iteration, best_val_loss, checkpoint_path)
-                        output_dir = os.path.join(hparams.output_directory, 'checkpoints', f'chk_{iteration}')
-                        # generate_benchmark_sentences(model, hparams, output_dir)
-                        _logger.info("Skipping benchmark generation as prosody predictor is removed.")
                     # barrier for distributed processes
                     if hparams.multiprocessing_distributed:
                         dist.barrier()
@@ -505,9 +511,8 @@ def train(gpu, hparams, log_file):
                 iteration += 1
                 tot_loss = 0.
                 indiv_loss = {
-                    'speaker_loss': 0., 'post_mult_loss': 0.,
-                    'duration_loss': 0., 'energy_loss': 0., 'pitch_loss': 0.,
-                    'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.
+                    'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
+                    'speaker_loss': 0., 'post_mult_loss': 0.
                 }
                 start = time.time()
                 accumulation_step = 0
@@ -523,8 +528,14 @@ def train(gpu, hparams, log_file):
                     if param_group['lr'] is not None:
                         param_group['lr'] = learning_rate
 
+    # Save final checkpoint when training loop exits (ensures at least one checkpoint)
+    if hparams.rank == 0 and iteration > 0:
+        final_path = os.path.join(hparams.output_directory, 'checkpoints', f'DaftExprt_{iteration}.pt')
+        _logger.info(f'Saving final checkpoint at iteration {iteration} to {final_path}')
+        save_checkpoint(model, optimizer, hparams, learning_rate, iteration, best_val_loss, final_path)
 
-def launch_training(data_set_dir, config_file, benchmark_dir, log_file, world_size=1, rank=0,
+
+def launch_training(data_set_dir, config_file, log_file, world_size=1, rank=0,
                     multiprocessing_distributed=True, master='tcp://localhost:54321'):
     ''' Launch training in distributed mode or on a single GPU
         PyTorch distributed training is performed using DistributedDataParrallel API
@@ -589,8 +600,7 @@ def launch_training(data_set_dir, config_file, benchmark_dir, log_file, world_si
     # update hparams
     hparams.data_set_dir = data_set_dir
     hparams.config_file = config_file
-    hparams.benchmark_dir = benchmark_dir
-    
+
     hparams.rank = rank
     hparams.world_size = world_size
     hparams.ngpus_per_node = ngpus_per_node
@@ -656,13 +666,11 @@ if __name__ == '__main__':
                         help='Data set containing .wav files')
     parser.add_argument('--config_file', type=str, required=True,
                         help='JSON configuration file to initialize hyper-parameters for training')
-    parser.add_argument('--benchmark_dir', type=str, required=True,
-                        help='directory to load benchmark sentences')
     parser.add_argument('--log_file', type=str, required=True,
                         help='path to save logger outputs')
 
     args = parser.parse_args()
     
     # launch training
-    launch_training(args.data_set_dir, args.config_file, args.benchmark_dir, args.log_file,
+    launch_training(args.data_set_dir, args.config_file, args.log_file,
                     args.world_size, args.rank, args.multiprocessing_distributed, args.master)

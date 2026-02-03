@@ -2,32 +2,32 @@
 # Daft-Exprt: Cross-Speaker Prosody Transfer on Any Text for Expressive Speech Synthesis
 
 <!-- omit in toc -->
-### Julian Zaïdi, Hugo Seuté, Benjamin van Niekerk, Marc-André Carbonneau
-In our [paper](https://arxiv.org/abs/2108.02271) we propose Daft-Exprt, a multi-speaker acoustic model advancing the state-of-the-art for cross-speaker prosody transfer on any text. This is one of the most challenging, and rarely directly addressed, task in speech synthesis, especially for highly expressive data. Daft-Exprt uses FiLM conditioning layers to strategically inject different prosodic information in all parts of the architecture. The model explicitly encodes traditional low-level prosody features such as pitch, loudness and duration, but also higher level prosodic information that helps generating convincing voices in highly expressive styles. Speaker identity and prosodic information are disentangled through an adversarial training strategy that enables accurate prosody transfer across speakers. Experimental results show that Daft-Exprt significantly outperforms strong baselines on inter-text cross-speaker prosody transfer tasks, while yielding naturalness comparable to state-of-the-art expressive models. Moreover, results indicate that the model discards speaker identity information from the prosody representation, and consistently generate speech with the desired voice. Visit our [demo page](https://ubisoft-laforge.github.io/speech/daft-exprt/) for audio samples related to the paper experiments.  
-
-### Pre-trained model
-**Full disclosure**: The model provided in this repository is not the same as in the paper evaluation. The model of the paper was trained with proprietary data which prevents us to release it publicly.  
-We pre-train Daft-Exprt on a combination of [LJ speech dataset](https://keithito.com/LJ-Speech-Dataset/) and the emotional speech dataset (ESD) from [Zhou et al](https://github.com/HLTSingapore/Emotional-Speech-Data).  
-Visit the [releases](https://github.com/ubisoft/ubisoft-laforge-daft-exprt/releases) of this repository to download the pre-trained model and to listen to prosody transfer examples using this same model.  
-
-<!-- omit in toc -->
 ## Table of Contents
 - [Installation](#installation)
   - [Local Environment](#local-environment)
   - [Docker Image](#docker-image)
-- [Quick Start Example](#quick-start-example)
-  - [Introduction](#introduction)
-  - [Dataset Formatting](#dataset-formatting)
-  - [Data Pre-Processing](#data-pre-processing)
+- [Quick Start](#quick-start)
+  - [Dataset format](#dataset-format)
+  - [Format datasets (LJ / ESD)](#format-datasets-lj--esd)
+  - [Pre-processing](#pre-processing)
   - [Training](#training)
-  - [Vocoder Fine-Tuning](#vocoder-fine-tuning)
-  - [TTS Synthesis](#tts-synthesis)
+  - [Vocoder fine-tuning dataset](#vocoder-fine-tuning-dataset)
+  - [Synthesis](#synthesis)
+- [Script reference](#script-reference)
+  - [training.py](#trainingpy)
+  - [extract_symbol_prosody.py](#extract_symbol_prosodypy)
+  - [compute_spk_stats_from_prosody.py](#compute_spk_stats_from_prosodypy)
+  - [adapt_accent.py](#adapt_accentpy)
+  - [synthesize.py](#synthesizepy)
+  - [format_dataset.py](#format_datasetpy)
+  - [Grid search and evaluation](#grid-search-and-evaluation)
 - [Citation](#citation)
 - [Contributing](#contributing)
 
 ## Installation
 
 ### Local Environment
+
 Requirements:
 - Ubuntu >= 20.04
 - Python >= 3.8
@@ -35,256 +35,311 @@ Requirements:
 - [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) >= 11.1
 - [CuDNN](https://developer.nvidia.com/rdp/cudnn-archive) >= v8.0.5
 
-We recommend using conda for python environment management, for example download and install [Miniconda](https://docs.conda.io/en/latest/miniconda.html).  
-Create your python environment and install dependencies using the Makefile:
+We recommend using conda. Create the environment and install dependencies:
+
 1. `conda create -n daft_exprt python=3.8 -y`
 2. `conda activate daft_exprt`
 3. `cd environment`
 4. `make`
 
-All Linux/Conda/Pip dependencies will be installed by the Makefile, and the repository will be installed as a pip package in editable mode.
+The repository is installed as a pip package in editable mode. Scripts live in `scripts/`; core code in `src/daft_exprt/`. Config defaults are in `src/daft_exprt/hparams.py`.
 
 ### Docker Image
-Requirements:
-- [NVIDIA Docker](https://github.com/NVIDIA/nvidia-docker)
-- [NVIDIA Driver](https://www.nvidia.com/Download/index.aspx?lang=en-us) >= 450.80.02
 
-Build the Docker image using the associated Dockerfile:  
-1. `docker build -f environment/Dockerfile -t daft_exprt .`
+Requirements: [NVIDIA Docker](https://github.com/NVIDIA/nvidia-docker), NVIDIA Driver >= 450.80.02.
 
-## Quick Start Example
+Build: `docker build -f environment/Dockerfile -t daft_exprt .`
 
-### Introduction
-This quick start guide will illustrate how to use the different scripts of this repository to:
-1. Format datasets
-2. Pre-process these datasets
-3. Train Daft-Exprt on the pre-processed data
-4. Generate a dataset for vocoder fine-tuning
-5. Use Daft-Exprt for TTS synthesis
+---
 
-All scripts are located in [scripts](scripts) directory.  
-Daft-Exprt source code is located in [daft_exprt](src/daft_exprt) directory.  
-Config parameters used in the scripts are all instanciated in [hparams.py](src/daft_exprt/hparams.py).  
+## 🚀 Quick Start
 
-As a quick start example, we consider using the 22kHz [LJ speech dataset](https://keithito.com/LJ-Speech-Dataset/) and the 16kHz emotional speech dataset (ESD) from [Zhou et al](https://github.com/HLTSingapore/Emotional-Speech-Data).  
-This combines a total of 11 speakers. All speaker datasets must be in the same root directory. For example:
-```
-/data_dir
-    LJ_Speech
-    ESD
-        spk_1
-        ...
-        spk_N
-```
+---
 
-In this example, we use the docker image built in the previous section:
- ```
-docker run -it --gpus all -v /path/to/data_dir:/workdir/data_dir -v path/to/repo_dir:/workdir/repo_dir IMAGE_ID
-```
+### Dataset format
 
+Each speaker dataset must follow this layout:
 
-### Dataset Formatting
-The source code expects the specific tree structure for each speaker data set:
 ```
 /speaker_dir
     metadata.csv
     /wavs
         wav_file_name_1.wav
         ...
-        wav_file_name_N.wav
 ```
 
-metadata.csv must be formatted as follows:
+`metadata.csv` format (pipe `|` separator):
+
 ```
 wav_file_name_1|text_1
-...
 wav_file_name_N|text_N
 ```
 
-Given each dataset has its own nomenclature, this project does not provide a ready-made universal script.  
-However, the script [format_dataset.py](scripts/format_dataset.py) already proposes the code to format LJ and ESD:
-```
-python format_dataset.py \
-    --data_set_dir /workdir/data_dir/LJ_Speech \
-    LJ
+All speaker roots must sit under a single data root, e.g.:
 
-python format_dataset.py \
-    --data_set_dir /workdir/data_dir/ESD \
-    ESD \
-    --language english
+```
+/data_dir
+    LJ_Speech
+    ESD
+        spk_1
+        ...
 ```
 
-### Data Pre-Processing
-In this section, the code will:
-1. Align data using MFA
-2. Extract features for training
-3. Create train and validation sets
-4. Extract features stats on the train set for speaker standardization
+### Format datasets (LJ / ESD)
 
-To pre-process all available formatted data (i.e. LJ and ESD in this example):
+Use `scripts/format_dataset.py` to produce the above structure for LJ and ESD:
+
+```bash
+python scripts/format_dataset.py --data_set_dir /path/to/LJ_Speech LJ
+python scripts/format_dataset.py --data_set_dir /path/to/ESD ESD --language english
 ```
-python training.py \
+
+### Pre-processing
+
+Pre-processing runs MFA alignment, feature extraction, train/validation split, feature stats, and **ECAPA speaker embeddings**.
+
+```bash
+python scripts/training.py \
     --experiment_name EXPERIMENT_NAME \
-    --data_set_dir /workdir/data_dir \
+    --data_set_dir /path/to/data_dir \
     pre_process
 ```
 
-This will pre-process data using the default hyper-parameters that are set for 22kHz audios.  
-All outputs related to the experiment will be stored in `/workdir/repo_dir/trainings/EXPERIMENT_NAME`.  
-You can also target specific speakers for data pre-processing. For example, to consider only ESD speakers:
-```
-python training.py \
+**Where outputs go:**
+
+- **Extracted features** (`.npy`, etc.) → features directory: by default `datasets/<language>/<sampling_rate>Hz/` (e.g. `datasets/english/22050Hz/`), or the path you pass to `--features_dir`.
+- **Experiment bookkeeping** (train/validation file lists, `config.json`, `stats.json`, logs, checkpoints) → `trainings/EXPERIMENT_NAME/`.
+
+To restrict to specific speakers:
+
+```bash
+python scripts/training.py \
     --experiment_name EXPERIMENT_NAME \
-    --speakers ESD/spk_1 ... ESD/spk_N \
-    --data_set_dir /workdir/data_dir \
+    --speakers ESD/spk_1 ESD/spk_2 \
+    --data_set_dir /path/to/data_dir \
     pre_process
 ```
 
-The pre-process function takes several arguments:
-- `--features_dir`: absolute path where pre-processed data will be stored. Default to `/workdir/repo_dir/datasets`
-- `--proportion_validation`: Proportion of examples that will be in the validation set. Default to `0.1`% per speaker.
-- `--nb_jobs`: number of cores to use for python multi-processing. If set to `max`, all CPU cores are used. Default to `6`.
-
-Note that if it is the first time that you pre-process the data, this step will take several hours.  
-You can decrease computing time by increasing the `--nb_jobs` parameter.  
-    
 ### Training
-Once pre-processing is finished, launch training. To train on all pre-processed data:
-```
-python training.py \
+
+Train on all pre-processed speakers (or the same `--speakers` list used at pre-process):
+
+```bash
+python scripts/training.py \
     --experiment_name EXPERIMENT_NAME \
-    --data_set_dir /workdir/data_dir \
+    --data_set_dir /path/to/data_dir \
     train
 ```
 
-Or if you targeted specific speakers during pre-processing (e.g. ESD speakers):
-```
-python training.py \
+> **Note:** During training, `train.py` does **not** load data from `data_set_dir`.  
+> Instead, it reads training and validation file lists from:
+>
+> - `trainings/<experiment>/train_english.txt`
+> - `trainings/<experiment>/validation_english.txt`
+
+Resume from a checkpoint with `--checkpoint CHECKPOINT_PATH`. TensorBoard: `tensorboard --logdir trainings/EXPERIMENT_NAME/logs`.
+
+### Vocoder fine-tuning dataset
+
+The `fine_tune` command **generates a mel + wav dataset** for training a vocoder (e.g. HiFi-GAN) **outside this repository**. This repo does not include vocoder training code; it only produces the paired data.
+
+```bash
+python scripts/training.py \
     --experiment_name EXPERIMENT_NAME \
-    --speakers ESD/spk_1 ... ESD/spk_N \
-    --data_set_dir /workdir/data_dir \
-    train
-```
-
-All outputs related to the experiment will be stored in `/workdir/repo_dir/trainings/EXPERIMENT_NAME`.  
-
-The train function takes several arguments:
-- `--checkpoint`: absolute path of a Daft-Exprt checkpoint. Default to `""`
-- `--no_multiprocessing_distributed`: disable PyTorch multi-processing distributed training. Default to `False`
-- `--world_size`: number of nodes for distributed training. Default to `1`.
-- `--rank`: node rank for distributed training. Default to `0`.
-- `--master`: url used to set up distributed training. Default to `tcp://localhost:54321`.
-
-These default values will launch a new training starting at iteration 0, using all available GPUs on the machine.  
-The code supposes that only 1 GPU is available on the machine.  
-Default [batch size](src/daft_exprt/hparams.py#L66) and [gradient accumulation](src/daft_exprt/hparams.py#L67) hyper-parameters are set to values to reproduce the batch size of 48 from the paper.
-
-The code also supports tensorboard logging. To display logging outputs:  
-`tensorboard --logdir_spec=EXPERIMENT_NAME:/workdir/repo_dir/trainings/EXPERIMENT_NAME/logs`
-
-### Vocoder Fine-Tuning
-Once training is finished, you can create a dataset for vocoder fine-tuning:
-```
-python training.py \
-    --experiment_name EXPERIMENT_NAME \
-    --data_set_dir /workdir/data_dir \
+    --data_set_dir /path/to/data_dir \
     fine_tune \
     --checkpoint CHECKPOINT_PATH
 ```
 
-Or if you targeted specific speakers during pre-processing and training (e.g. ESD speakers):
+Output: `trainings/EXPERIMENT_NAME/fine_tuning_dataset/`.
+
+### Synthesis
+
+Synthesis requires:
+
+- **Symbol-level prosody file** — one line per utterance: list of `(symbol, duration, pitch, energy)` tuples (e.g. from `extract_symbol_prosody.py`).
+- **Speaker stats** — JSON with mean/std or a directory of wavs to compute them.
+- **Speaker and accent embeddings** — from audio dirs (`--spk_emb_audios_dir`, `--accent_emb_audios_dir`), or from the checkpoint (`memorized_spk_emb` / `memorized_accent_emb`, e.g. after `adapt_accent.py`). If neither source yields both, the script exits with an error.
+- **Vocoder** — HiFi-GAN; a universal model is used if `--vocoder_checkpoint` is omitted (downloaded on demand).
+
+**Example:**
+
+```bash
+python scripts/synthesize.py \
+    --output_dir /path/to/outputs \
+    --checkpoint trainings/MY_EXP/checkpoints/checkpoint.pt \
+    --symbol_prosody_file /path/to/prosody.txt \
+    --new_speaker_stats /path/to/stats.json \
+    --spk_emb_audios_dir /path/to/speaker_wavs \
+    --accent_emb_audios_dir /path/to/accent_wavs
 ```
-python training.py \
-    --experiment_name EXPERIMENT_NAME \
-    --speakers ESD/spk_1 ... ESD/spk_N \
-    --data_set_dir /workdir/data_dir \
-    fine_tune \
-    --checkpoint CHECKPOINT_PATH
-```
 
-Fine-tuning dataset will be stored in `/workdir/repo_dir/trainings/EXPERIMENT_NAME/fine_tuning_dataset`.  
+If the checkpoint already contains memorized embeddings (e.g. from accent adaptation), you can omit the audio dirs.
 
-### TTS Synthesis
-For an example on how to use Daft-Exprt for TTS synthesis, run the script [synthesize.py](scripts/synthesize.py).  
-```
-python synthesize.py \
-    --output_dir OUTPUT_DIR \
-    --checkpoint CHECKPOINT
-```
+---
 
-Default sentences and reference utterances are used in the script.  
+## 📋 Script reference
 
-The script also offers the possibility to:
-- `--batch_size`: process batch of sentences in parallel
-- `--real_time_factor`: estimate Daft-Exprt real time factor performance given the chosen batch size
-- `--control`: perform local prosody control
-- `--symbol_prosody_file`: bypass phonemization/prosody prediction by supplying tuples generated with `extract_symbol_prosody.py`
-- `--use_griffin_lim`: keep the legacy Griffin-Lim reconstruction (otherwise a universal HiFi-GAN vocoder is used automatically)
-- `--vocoder_checkpoint`: provide a custom HiFi-GAN generator checkpoint; if omitted, a pretrained universal 22kHz model is downloaded on demand
+---
 
-### Symbol-Level Prosody Extraction
-Use [extract_symbol_prosody.py](scripts/extract_symbol_prosody.py) to align raw audio with its transcript and export per-symbol duration, pitch, and energy tuples that mirror the targets of the local prosody predictor. The script:
-- reads a manifest where each line contains `absolute/path/to/audio.wav|verbatim transcript`
-- looks up words in the provided MFA dictionary first, only running MFA G2P for out-of-vocabulary words (either `--g2p_preset american_english|indian_english` or `--g2p_model /path/to/model.zip`)
-- runs Montreal Forced Aligner with the provided (or auto-generated) dictionary and MFA acoustic model
-- extracts mel spectrograms, REAPER pitch, and converts frame-level values to phoneme-level tuples `(symbol, duration_in_frames, mean_pitch, mean_energy)`
+### training.py
 
-Dependencies: MFA CLI (`mfa align` / `mfa g2p`), the matching acoustic/G2P packages (download with `mfa download acoustic ...` / `mfa download g2p ...`), and the `reaper` binary for F0 extraction. Provide an MFA dictionary via `--dictionary` or let the script reuse the default one bundled with the pretrained model.
+Entry point for pre-processing, training, and vocoder fine-tuning dataset generation. All commands share:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-en, --experiment_name` | — | Name of the experiment directory under `trainings/`. |
+| `-dd, --data_set_dir` | — | Root path containing speaker datasets. |
+| `-spks, --speakers` | `[]` | Optional list of speaker subdirs; if empty, all speakers under `data_set_dir` are used. |
+| `-lg, --language` | `'english'` | Language for MFA/text. |
+| `-cfg, --config_file` | `''` | Optional config path; default is `trainings/<experiment_name>/config.json`. |
+
+**pre_process**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-fd, --features_dir` | `PROJECT_ROOT/datasets` | Where to store pre-processed features. When this default is used, features are written to `datasets/<language>/<sampling_rate>Hz/` (e.g. `datasets/english/22050Hz/`). |
+| `-pv, --proportion_validation` | `0.1` | Proportion (e.g. 0.1 = 10%) of each speaker’s data used for validation. |
+| `-nj, --nb_jobs` | `'6'` | Number of jobs for multiprocessing; `'max'` uses all cores. |
+
+**train**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-chk, --checkpoint` | `''` | Path to checkpoint to resume from. |
+| `-nmpd, --no_multiprocessing_distributed` | `False` | Disable distributed training. |
+| `-ws, --world_size` | `1` | Number of nodes. |
+| `-r, --rank` | `0` | Node rank. |
+| `-m, --master` | `'tcp://localhost:54321'` | Master URL for distributed training. |
+| `--cpu` | `False` | Use CPU (e.g. for debugging). |
+
+**fine_tune**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-chk, --checkpoint` | — | Checkpoint used to generate mel/wav pairs for external vocoder training. |
+
+---
+
+### extract_symbol_prosody.py
+
+Extracts symbol-level duration, pitch, and energy from audio using a manifest, MFA alignment, and REAPER pitch. Manifest format: one line per audio, `absolute_path_to_audio.wav|transcript` (separator is fixed as `|`). Output: one line per audio, each line a Python list of `(symbol, duration_frames, pitch, energy)` tuples.
+
+**Dependencies**: `mfa` CLI, MFA acoustic/G2P models (`mfa download ...`), `reaper` on PATH.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--manifest` | — | Text file with one `audio_path\|transcript` per line. |
+| `--output` | — | Output txt path. |
+| `--language` | `'english'` | Language for MFA and text cleaner. |
+| `--g2p_preset` | `'american_english'` | Preset for G2P (`american_english` or `indian_english`). |
+| `--g2p_model` | `''` | Explicit path to MFA G2P model zip (overrides preset). |
+| `--dictionary` | `''` | MFA pronunciation dictionary; defaults to config default. |
+| `--acoustic_model` | `''` | MFA acoustic model zip; defaults to config default. |
+| `--nb_jobs` | `4` | Parallel jobs for MFA. |
+| `--work_dir` | `PROJECT_ROOT/tmp_symbol_prosody` | Scratch directory. |
+| `--keep_temps` | `False` | Keep intermediate files. |
 
 Example:
-```
+
+```bash
 python scripts/extract_symbol_prosody.py \
     --manifest /path/to/list.txt \
-    --output /tmp/prosody.txt \
+    --output /path/to/prosody.txt \
     --g2p_preset american_english \
-    --nb_jobs 4 \
-    --include_audio_path
-```
-Output file `/tmp/prosody.txt` will contain one line per audio. Each line is a Python-style list of tuples; optionally the original audio path is prefixed when `--include_audio_path` is set:
-```
-/abs/audio.wav|[('DH', 5, 3.512, 1.104), ('AH0', 4, 3.403, 1.089), ('S', 3, 0.000, 0.982), ...]
-```
-Pass `--mix_output False` if you instead need four parallel arrays (symbols, durations, pitch, energy):
-```
-/abs/audio.wav|(['DH', 'AH0', 'S', ...], [5, 4, 3, ...], [3.512, 3.403, 0.0, ...], [1.104, 1.089, 0.982, ...])
-```
-These tuples can replace the local prosody predictor outputs when performing deterministic prosody control.
-
-## Evaluation Utilities
-
-### WER and Accent Confidence Tracking
-To benchmark accent conversion quality we provide `scripts/evaluation/compute_wer_and_accent_metrics.py`.  
-It ingests two manifests (pre- and post-conversion) formatted as `utt_id|/abs/or/rel/path.wav|Reference transcript` (or without the `utt_id`, where the filename stem is used), transcribes the converted audio with an OpenAI Whisper checkpoint, and scores both audio versions with the SpeechBrain `Jzuluaga/accent-id-commonaccent_xlsr-en-english` custom interface. The script emits a JSON report that lists per-utterance WER, transcripts, and source/target accent confidences (with deltas), plus global micro WER and average confidence shifts. If `--plot-path` is provided an overlapping histogram of the predicted accent class distributions before vs. after conversion is also saved.
-
-```
-python scripts/evaluation/compute_wer_and_accent_metrics.py \
-    --before-manifest /path/to/source_manifest.txt \
-    --after-manifest /path/to/converted_manifest.txt \
-    --source-class indian \
-    --target-class american \
-    --output-json outputs/indian_to_american_metrics.json \
-    --plot-path outputs/indian_to_american_hist.png
+    --nb_jobs 4
 ```
 
-Key options let you pick which Whisper size to run (`--whisper-model`), choose where the SpeechBrain cache lives (`--accent-cache-dir`), change the manifest separator, disable accent prediction caching (`--disable-accent-cache`), set an artifact prefix (`--experiment-name`), or cap the number of processed utterances (useful for smoke tests). Relative audio paths are resolved against their manifest location, and both manifests must expose the same utterance identifiers in the same order. Source/target accents should be one of the CommonAccent labels used by the classifier (`united_states`, `england`, `australia`, `india`, `canada`, `bermuda`, `scotland`, `africa`, `ireland`, `new_zealand`, `wales`, `malaysia`, `philippines`, `singapore`, `hong_kong`, `south_atlantic`), with common synonyms like `american` automatically mapped.
+Output lines look like: `[('DH', 5, 3.512, 1.104), ('AH0', 4, 3.403, 1.089), ...]`
 
-## Citation
+---
+
+### compute_spk_stats_from_prosody.py
+
+Computes pitch and energy mean/std from a symbol-prosody file (e.g. produced by `extract_symbol_prosody.py`). Used to generate `--new_speaker_stats` for synthesis when you do not have training-set stats.
+
+**Input:** One line per utterance; each line is a Python literal: either a list of `(symbol, duration, pitch, energy)` tuples (extract_symbol_prosody format) or a single tuple `(symbols, durations, pitch, energy)` with four sequences. Only voiced pitch (`> 0`) and non-zero energy values are included.
+
+**Output:** JSON with `pitch` and `energy`, each having `mean` and `std` (population std).
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `input_txt` | — | File produced by `extract_symbol_prosody.py` (or same format). |
+| `--output` | — | Optional JSON path; if omitted, stats are printed to stdout. |
+
+Example:
+
+```bash
+python scripts/compute_spk_stats_from_prosody.py prosody.txt --output stats.json
 ```
-@article{Zaidi2021,
-abstract = {},
-journal = {arXiv},
-arxivId = {2108.02271},
-author = {Za{\"{i}}di, Julian and Seut{\'{e}}, Hugo and van Niekerk, Benjamin and Carbonneau, Marc-Andr{\'{e}}},
-eprint = {2108.02271},
-title = {{Daft-Exprt: Robust Prosody Transfer Across Speakers for Expressive Speech Synthesis}},
-url = {https://arxiv.org/pdf/2108.02271.pdf},
-year = {2021}
-}
+
+---
+
+### adapt_accent.py
+
+Few-shot accent adaptation by unfreezing (all or selected) decoder blocks and optimizing on accent data. Saves checkpoints with `memorized_spk_emb` and `memorized_accent_emb` for use in synthesis.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint` | — | Base Daft-Exprt checkpoint. |
+| `--config_file` | — | Config JSON path. |
+| `--accent_dir` | — | Directory of accent feature `.npy` files (and optional `.spk_emb.npy`). |
+| `--recon_dir` | `''` | Directory for reconstruction targets; defaults to `accent_dir`. |
+| `--output_name` | — | Name for the adapted checkpoint. |
+| `--learning_rate` | `0.01` | Learning rate. |
+| `--iterations` | `100` | Training steps. |
+| `--unfreeze_decoder_blocks` | `''` | Comma-separated block indices or `all`/`none`. |
+| `--unfreeze_decoder_projection` | `False` | Unfreeze decoder projection. |
+| `--unfreeze_decoder_blocks_ff_only` | `False` | Unfreeze only feed-forward in blocks. |
+| `--unfreeze_decoder_blocks_att_only` | `False` | Unfreeze only attention in blocks. |
+| `--unfreeze_decoder_blocks_convs_only` | `False` | Unfreeze only convs in blocks. |
+| `--seed` | `42` | Random seed. |
+| `--lambda_delta_l1` | `0.0` | L1 penalty on parameter deltas. |
+| `--stats_path` | `''` | Path to stats JSON for normalization. |
+| `--random_spk_emb` | `False` | Use random speaker embedding. |
+| `--mean_spk_emb` | `False` | Use mean speaker embedding. |
+| `--random_accent_emb` | `False` | Use random accent embedding. |
+| `--mean_accent_emb` | `False` | Use mean accent embedding. |
+
+---
+
+### synthesize.py
+
+Generates speech from a symbol-prosody file and speaker/accent conditioning. Requires a HiFi-GAN vocoder.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-out, --output_dir` | — | Directory for output wavs and plots. |
+| `-chk, --checkpoint` | — | Daft-Exprt checkpoint (may contain memorized embeddings). |
+| `-spf, --symbol_prosody_file` | — | File with one line per utterance: list of `(symbol, duration, pitch, energy)` tuples. |
+| `--vocoder_checkpoint` | `''` | HiFi-GAN generator path; if empty, universal model is used. |
+| `-bs, --batch_size` | `50` | Batch size for inference. |
+| `--new_speaker_stats` | — | JSON stats path or directory of wavs to compute stats. |
+| `--plot_prosody_files_to_compare` | `''` | Optional manifest of wavs for prosody comparison plots. |
+| `--alpha_dur` | `1.0` | Duration scaling. |
+| `--alpha_pitch` | `1.0` | Pitch scaling. |
+| `--alpha_energy` | `1.0` | Energy scaling. |
+| `--spk_emb_audios_dir` | `''` | Directory of wavs to compute speaker embedding. |
+| `--accent_emb_audios_dir` | `''` | Directory of wavs to compute accent embedding. |
+
+**Embeddings:** From audio dirs first; if missing, from `memorized_spk_emb` / `memorized_accent_emb` in the checkpoint. If neither source yields both, the script exits with an error.
+
+---
+
+### format_dataset.py
+
+Formats LJ Speech and ESD into the required directory layout. Usage:
+
+```bash
+python scripts/format_dataset.py --data_set_dir /path/to/LJ_Speech LJ
+python scripts/format_dataset.py --data_set_dir /path/to/ESD ESD --language english
 ```
 
-## Contributing
-Any contribution to this repository is more than welcome!  
-If you have any feedback, please send it to julian.zaidi@ubisoft.com.  
+---
 
+### Grid search and evaluation
 
-© [2021] Ubisoft Entertainment. All Rights Reserved
+- **Grid search**: `scripts/grid_search_accent_v2.py` runs multiple `adapt_accent.py` runs with different hyperparameters (edit the script’s config block for paths and flags).
+- **WER and accent metrics**: `scripts/evaluation/compute_wer_and_accent_metrics.py` compares pre- and post-conversion manifests with Whisper and SpeechBrain accent ID; see script help for arguments.
+
+---

@@ -11,38 +11,17 @@ import librosa
 import numpy as np
 import torch
 
-from scipy import signal
 from scipy.io import wavfile
 from shutil import rmtree
 
 from daft_exprt.cleaners import collapse_whitespace, text_cleaner
 from daft_exprt.extract_features import extract_energy, extract_pitch, mel_spectrogram_HiFi, rescale_wav_to_float32
-from daft_exprt.griffin_lim import griffin_lim_reconstruction_from_mel_spec
 from daft_exprt.symbols import ascii, eos, punctuation, whitespace
 from daft_exprt.utils import chunker, launch_multi_process, plot_2d_data
 
 
 _logger = logging.getLogger(__name__)
 FILE_ROOT = os.path.dirname(os.path.realpath(__file__))
-
-
-def _smooth_mel_for_vocoder(mel_spec, kernel=(0.25, 0.5, 0.25)):
-    """Very light temporal smoothing to damp narrow-band spikes before vocoding."""
-    if mel_spec.shape[1] < 3:
-        return mel_spec
-    kernel = np.asarray(kernel, dtype=np.float32)
-    smoothed = np.apply_along_axis(lambda row: np.convolve(row, kernel, mode='same'), axis=1, arr=mel_spec)
-    return smoothed.astype(np.float32)
-
-
-def _gentle_lowpass(audio, sampling_rate, cutoff_hz=7500.0):
-    """Shallow low-pass filter to mask metallic highs introduced by mismatched mels."""
-    if audio.size == 0:
-        return audio
-    nyquist = 0.5 * sampling_rate
-    norm_cutoff = min(cutoff_hz / nyquist, 0.99)
-    b, a = signal.butter(4, norm_cutoff, btype='low')
-    return signal.filtfilt(b, a, audio).astype(np.float32)
 
 
 def phonemize_sentence(sentence, hparams, log_queue):
@@ -54,7 +33,7 @@ def phonemize_sentence(sentence, hparams, log_queue):
     # load dictionary and extract word transcriptions
     word_trans = collections.defaultdict(list)
     with open(dictionary, 'r', encoding='utf-8') as f:
-        lines = [line.strip().split() for line in f.readlines()] 
+        lines = [line.strip().split() for line in f.readlines()]
     for line in lines:
         word_trans[line[0].lower()].append(line[1:])
     # characters to consider in the sentence
@@ -62,27 +41,22 @@ def phonemize_sentence(sentence, hparams, log_queue):
         all_chars = ascii + punctuation
     else:
         raise NotImplementedError()
-    
+
     # clean sentence
-    # "that's, an 'example! ' of a sentence. '"
     sentence = text_cleaner(sentence.strip(), hparams.language).lower().strip()
-    # split sentence:
-    # [',', "that's", ',', 'an', "example'", '!', "'", 'of', 'a', 'sentence', '.', '.', '.', "'"]
+    # split sentence
     sent_words = re.findall(f"[\w']+|[{punctuation}]", sentence.lower().strip())
-    # remove characters that are not letters or punctuation:
-    # [',', "that's", ',', 'an', "example'", '!', 'of', 'a', 'sentence', '.', '.', '.']
+    # remove characters that are not letters or punctuation
     sent_words = [x for x in sent_words if len(re.sub(f'[^{all_chars}]', '', x)) != 0]
     # be sure to begin the sentence with a word and not a punctuation
-    # ["that's", ',', 'an', "example'", '!', 'of', 'a', 'sentence', '.', '.', '.']
     while sent_words[0] in punctuation:
         sent_words.pop(0)
     # keep only one punctuation type at the end
-    # ["that's", ',', 'an', "example'", '!', 'of', 'a', 'sentence']
     punctuation_end = None
     while sent_words[-1] in punctuation:
         punctuation_end = sent_words.pop(-1)
     sent_words.append(punctuation_end)
-    
+
     # phonemize words and add word boundaries
     sentence_phonemized, unk_words = [], []
     while len(sent_words) != 0:
@@ -100,7 +74,7 @@ def phonemize_sentence(sentence, hparams, log_queue):
             sentence_phonemized.append(word_bound)
     # add EOS token
     sentence_phonemized.append(eos)
-    
+
     # use MFA g2p model to phonemize unknown words
     if len(unk_words) != 0:
         rand_name = str(uuid.uuid4())
@@ -127,143 +101,66 @@ def phonemize_sentence(sentence, hparams, log_queue):
     return sentence_phonemized
 
 
-def save_mel_spec_plot_and_audio(item, output_dir, hparams, log_queue):
-    ''' Save mel-outputs/alignment plots and generate an audio using Griffin-Lim algorithm
-
-    :param item:                (n_mel_channels, T + 1) -- mel-spectrogram numpy array
-    :param alignments:          (L, T + 1) -- alignment numpy array
-    :param output_dir:          directory to save plots and audio
-    :param file_name:           filename to save plots and audio
-    :param hparams:             hyper-parameters used for pre-processing and training
-    :param log_queue:           logging queue for multi-processing
-    '''
-    # create logger from logging queue
-    qh = logging.handlers.QueueHandler(log_queue)
-    root = logging.getLogger()
-    if not root.hasHandlers():
-        root.setLevel(logging.INFO)
-        root.addHandler(qh)
-    logger = logging.getLogger(f"worker{str(uuid.uuid4())}")
-    
-    # extract items
-    file_name, mel_spec, weight = item
-    # create a figure from the output
-    plot_2d_data(data=(mel_spec, weight),
-                 x_labels=('Mel-Spec Prediction', 'Alignments'),
-                 filename=os.path.join(output_dir, file_name + '.png'))
-    # generate audio using Griffin-Lim
-    waveform = griffin_lim_reconstruction_from_mel_spec(mel_spec, hparams, logger)
-    if waveform != []:
-        wavfile.write(os.path.join(output_dir, file_name + '.wav'), hparams.sampling_rate, waveform)
-
-
 def collate_tensors(batch_sentences, batch_dur_factors, batch_energy_factors,
-                    batch_pitch_factors, pitch_transform, batch_refs,
+                    batch_pitch_factors, pitch_transform,
                     batch_speaker_ids, batch_file_names, hparams,
                     external_prosody=None):
-    ''' Extract PyTorch tensors for each sentence and collate them for batch generation
-    '''
-    # gather batch
+    ''' Collate tensors for synthesis. Synthesis uses external_accent_emb only; no ref .npz. '''
     batch = []
-    for sentence, dur_factors, energy_factors, pitch_factors, refs in \
-        zip(batch_sentences, batch_dur_factors, batch_energy_factors, batch_pitch_factors, batch_refs):
-            # encode input text as a sequence of int symbols
-            symbols = []
-            for item in sentence:
-                if isinstance(item, list):  # correspond to phonemes of a word
-                    symbols += [hparams.symbols.index(phone) for phone in item]
-                else:  # correspond to word boundaries
-                    symbols.append(hparams.symbols.index(item))
-            symbols = torch.IntTensor(symbols)  # (L, )
-            # extract duration factors
-            if dur_factors is None:
-                dur_factors = [1. for _ in range(len(symbols))]
-            dur_factors = torch.FloatTensor(dur_factors)  # (L, )
-            assert(len(dur_factors) == len(symbols)), \
-                _logger.error(f'{len(dur_factors)} duration factors whereas there a {len(symbols)} symbols')
-            # extract energy factors
-            if energy_factors is None:
-                energy_factors = [1. for _ in range(len(symbols))]
-            energy_factors = torch.FloatTensor(energy_factors)  # (L, )
-            assert(len(energy_factors) == len(symbols)), \
-                _logger.error(f'{len(energy_factors)} energy factors whereas there a {len(symbols)} symbols')
-            # extract pitch factors
-            if pitch_factors is None:
-                if pitch_transform == 'add':
-                    pitch_factors = [0. for _ in range(len(symbols))]
-                elif pitch_transform == 'multiply':
-                    pitch_factors = [1. for _ in range(len(symbols))]
-            pitch_factors = torch.FloatTensor(pitch_factors)  # (L, )
-            assert(len(pitch_factors) == len(symbols)), \
-                _logger.error(f'{len(pitch_factors)} pitch factors whereas there a {len(symbols)} symbols')
-            # extract references
-            refs = np.load(refs)
-            energy_ref, pitch_ref, mel_spec_ref = refs['energy'], refs['pitch'], refs['mel_spec']
-            energy_ref = torch.from_numpy(energy_ref).float()  # (T_ref, )
-            pitch_ref = torch.from_numpy(pitch_ref).float()  # (T_ref, )
-            mel_spec_ref = torch.from_numpy(mel_spec_ref).float()  # (n_mel_channels, T_ref)
-            # gather data
-            batch.append([symbols, dur_factors, energy_factors, pitch_factors, energy_ref, pitch_ref, mel_spec_ref])
-    
-    # find symbols sequence max length
+    for sentence, dur_factors, energy_factors, pitch_factors in \
+        zip(batch_sentences, batch_dur_factors, batch_energy_factors, batch_pitch_factors):
+        symbols = []
+        for item in sentence:
+            if isinstance(item, list):
+                symbols += [hparams.symbols.index(phone) for phone in item]
+            else:
+                symbols.append(hparams.symbols.index(item))
+        symbols = torch.IntTensor(symbols)
+        if dur_factors is None:
+            dur_factors = [1. for _ in range(len(symbols))]
+        dur_factors = torch.FloatTensor(dur_factors)
+        assert len(dur_factors) == len(symbols)
+        if energy_factors is None:
+            energy_factors = [1. for _ in range(len(symbols))]
+        energy_factors = torch.FloatTensor(energy_factors)
+        assert len(energy_factors) == len(symbols)
+        if pitch_factors is None:
+            if pitch_transform == 'add':
+                pitch_factors = [0. for _ in range(len(symbols))]
+            else:
+                pitch_factors = [1. for _ in range(len(symbols))]
+        pitch_factors = torch.FloatTensor(pitch_factors)
+        assert len(pitch_factors) == len(symbols)
+        batch.append([symbols, dur_factors, energy_factors, pitch_factors])
+
     input_lengths, ids_sorted_decreasing = \
         torch.sort(torch.LongTensor([len(x[0]) for x in batch]), dim=0, descending=True)
     max_input_len = input_lengths[0]
-    # right pad sequences to max input length
     symbols = torch.LongTensor(len(batch), max_input_len).zero_()
     dur_factors = 1 + torch.FloatTensor(len(batch), max_input_len).zero_()
     energy_factors = 1 + torch.FloatTensor(len(batch), max_input_len).zero_()
     if pitch_transform == 'add':
         pitch_factors = torch.FloatTensor(len(batch), max_input_len).zero_()
-    elif pitch_transform == 'multiply':
+    else:
         pitch_factors = 1 + torch.FloatTensor(len(batch), max_input_len).zero_()
-    # fill padded arrays
     for i in range(len(ids_sorted_decreasing)):
-        # extract batch sequences
-        symbols_seq = batch[ids_sorted_decreasing[i]][0]
-        dur_factors_seq = batch[ids_sorted_decreasing[i]][1]
-        energy_factors_seq = batch[ids_sorted_decreasing[i]][2]
-        pitch_factors_seq = batch[ids_sorted_decreasing[i]][3]
-        # add sequences to padded arrays
-        symbols[i, :symbols_seq.size(0)] = symbols_seq
-        dur_factors[i, :dur_factors_seq.size(0)] = dur_factors_seq
-        energy_factors[i, :energy_factors_seq.size(0)] = energy_factors_seq
-        pitch_factors[i, :pitch_factors_seq.size(0)] = pitch_factors_seq
-    
-    # find reference max length
-    max_ref_len = max([x[6].size(1) for x in batch])
-    # right zero-pad references to max output length
-    energy_refs = torch.FloatTensor(len(batch), max_ref_len).zero_()
-    pitch_refs = torch.FloatTensor(len(batch), max_ref_len).zero_()
-    mel_spec_refs = torch.FloatTensor(len(batch), hparams.n_mel_channels, max_ref_len).zero_()
-    ref_lengths = torch.LongTensor(len(batch))
-    # fill padded arrays
-    for i in range(len(ids_sorted_decreasing)):
-        # extract batch sequences
-        energy_ref_seq = batch[ids_sorted_decreasing[i]][4]
-        pitch_ref_seq = batch[ids_sorted_decreasing[i]][5]
-        mel_spec_ref_seq = batch[ids_sorted_decreasing[i]][6]
-        # add sequences to padded arrays
-        energy_refs[i, :energy_ref_seq.size(0)] = energy_ref_seq
-        pitch_refs[i, :pitch_ref_seq.size(0)] = pitch_ref_seq
-        mel_spec_refs[i, :, :mel_spec_ref_seq.size(1)] = mel_spec_ref_seq
-        ref_lengths[i] = mel_spec_ref_seq.size(1)
-    
-    # reorganize speaker IDs and file names
+        symbols[i, :batch[ids_sorted_decreasing[i]][0].size(0)] = batch[ids_sorted_decreasing[i]][0]
+        dur_factors[i, :batch[ids_sorted_decreasing[i]][1].size(0)] = batch[ids_sorted_decreasing[i]][1]
+        energy_factors[i, :batch[ids_sorted_decreasing[i]][2].size(0)] = batch[ids_sorted_decreasing[i]][2]
+        pitch_factors[i, :batch[ids_sorted_decreasing[i]][3].size(0)] = batch[ids_sorted_decreasing[i]][3]
+
     file_names = []
     speaker_ids = torch.LongTensor(len(batch))
     for i in range(len(ids_sorted_decreasing)):
         file_names.append(batch_file_names[ids_sorted_decreasing[i]])
         speaker_ids[i] = batch_speaker_ids[ids_sorted_decreasing[i]]
-    
+
     sorted_external = None
     if external_prosody is not None:
-        assert len(external_prosody) == len(batch_sentences), \
-            _logger.error('Mismatch between external prosody entries and sentences in the batch')
+        assert len(external_prosody) == len(batch_sentences)
         sorted_external = [external_prosody[idx] for idx in ids_sorted_decreasing]
-    return symbols, dur_factors, energy_factors, pitch_factors, input_lengths, \
-        energy_refs, pitch_refs, mel_spec_refs, ref_lengths, speaker_ids, file_names, sorted_external
-    
+    return symbols, dur_factors, energy_factors, pitch_factors, input_lengths, speaker_ids, file_names, sorted_external
+
 
 def _normalize_external_feature(values, zero_mask, target_stats, source_stats=None):
     """Apply source->target z-score mapping while preserving zeros."""
@@ -288,42 +185,30 @@ def _normalize_external_feature(values, zero_mask, target_stats, source_stats=No
     return values
 
 
-def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_factors,
+def generate_batch_mel_specs(model, batch_sentences, batch_dur_factors,
                              batch_energy_factors, batch_pitch_factors, pitch_transform,
                              batch_speaker_ids, batch_file_names, output_dir, hparams,
-                             n_jobs, use_griffin_lim=True, batch_external_prosody=None,
-                             vocoder=None, source_stats=None, reduce_buzz=False,
-                             neutralize_prosody=False, neutralize_speaker_encoder=False,
-                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0, 
+                             n_jobs, batch_external_prosody=None,
+                             vocoder=None, source_stats=None,
+                             alpha_dur=1.0, alpha_pitch=1.0, alpha_energy=1.0,
                              external_embeddings=None, external_accent_emb=None):
-    ''' Generate batch mel-specs using Daft-Exprt
-    '''
-    # add speaker info to file name
+    ''' Generate batch mel-specs using Daft-Exprt. Synthesis uses external_accent_emb only; no refs. '''
     for idx, file_name in enumerate(batch_file_names):
-        file_name += f'_spk_{batch_speaker_ids[idx]}'
-        file_name += f'_ref_{os.path.basename(batch_refs[idx]).replace(".npz", "")}'
-        batch_file_names[idx] = file_name
-        _logger.info(f'Generating "{batch_sentences[idx]}" as "{file_name}"')
-    # collate batch tensors
-    symbols, dur_factors, energy_factors, pitch_factors, input_lengths, \
-        energy_refs, pitch_refs, mel_spec_refs, ref_lengths, speaker_ids, file_names, sorted_external_prosody = \
-            collate_tensors(batch_sentences, batch_dur_factors, batch_energy_factors,
-                            batch_pitch_factors, pitch_transform, batch_refs,
-                            batch_speaker_ids, batch_file_names, hparams,
-                            external_prosody=batch_external_prosody)
-    # put tensors on GPU
+        batch_file_names[idx] = file_name + f'_spk_{batch_speaker_ids[idx]}'
+        _logger.info(f'Generating "{batch_sentences[idx]}" as "{batch_file_names[idx]}"')
+    symbols, dur_factors, energy_factors, pitch_factors, input_lengths, speaker_ids, file_names, sorted_external_prosody = \
+        collate_tensors(batch_sentences, batch_dur_factors, batch_energy_factors,
+                        batch_pitch_factors, pitch_transform,
+                        batch_speaker_ids, batch_file_names, hparams,
+                        external_prosody=batch_external_prosody)
     gpu = next(model.parameters()).device
     speaker_ids_cpu = speaker_ids.clone()
-    symbols = symbols.cuda(gpu, non_blocking=True).long()  # (B, L_max)
-    dur_factors = dur_factors.cuda(gpu, non_blocking=True).float()  # (B, L_max)
-    energy_factors = energy_factors.cuda(gpu, non_blocking=True).float()  # (B, L_max)
-    pitch_factors = pitch_factors.cuda(gpu, non_blocking=True).float()  # (B, L_max)
-    input_lengths = input_lengths.cuda(gpu, non_blocking=True).long()  # (B, )
-    energy_refs = energy_refs.cuda(gpu, non_blocking=True).float()  # (B, T_max)
-    pitch_refs = pitch_refs.cuda(gpu, non_blocking=True).float()  # (B, T_max)
-    mel_spec_refs = mel_spec_refs.cuda(gpu, non_blocking=True).float()  # (B, n_mel_channels, T_max)
-    ref_lengths = ref_lengths.cuda(gpu, non_blocking=True).long()  # (B, )
-    speaker_ids = speaker_ids_cpu.cuda(gpu, non_blocking=True).long()  # (B, )
+    symbols = symbols.cuda(gpu, non_blocking=True).long()
+    dur_factors = dur_factors.cuda(gpu, non_blocking=True).float()
+    energy_factors = energy_factors.cuda(gpu, non_blocking=True).float()
+    pitch_factors = pitch_factors.cuda(gpu, non_blocking=True).float()
+    input_lengths = input_lengths.cuda(gpu, non_blocking=True).long()
+    speaker_ids = speaker_ids_cpu.cuda(gpu, non_blocking=True).long()
 
     external_tensors = None
     if sorted_external_prosody is not None:
@@ -337,30 +222,33 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
         for idx, (entry, seq_len) in enumerate(zip(sorted_external_prosody, input_lengths.cpu().tolist())):
             assert len(entry['symbols']) == seq_len, \
                 _logger.error(f'External prosody length mismatch for sample {file_names[idx]}')
-            
+
             frames = torch.FloatTensor(entry['durations_frames'])
-            
+
             # Apply variance exaggeration
-            # Formula: x' = mu + alpha * (x - mu)
-            # Duration
             dur_mask = (frames > 0)
             if dur_mask.any() and alpha_dur != 1.0:
                 dur_mean = frames[dur_mask].mean()
                 frames[dur_mask] = dur_mean + alpha_dur * (frames[dur_mask] - dur_mean)
-                frames = torch.clamp(frames, min=0.0) # Ensure no negative durations
-            
+                frames = torch.clamp(frames, min=0.0)
+
             ext_duration[idx, :seq_len] = frames * hop_in_seconds
-            ext_duration_int[idx, :seq_len] = torch.round(frames).long() # Re-calculate int frames from modified float frames
+            ext_duration_int[idx, :seq_len] = torch.round(frames).long()
 
             energy_vals = torch.FloatTensor(entry['energy'])
             pitch_vals = torch.FloatTensor(entry['pitch'])
             energy_zero = (energy_vals == 0.)
             pitch_zero = (pitch_vals == 0.)
             speaker_id = speaker_ids_cpu[idx].item()
-            energy_mean = hparams.stats[f'spk {speaker_id}']['energy']['mean']
-            energy_std = hparams.stats[f'spk {speaker_id}']['energy']['std']
-            pitch_mean = hparams.stats[f'spk {speaker_id}']['pitch']['mean']
-            pitch_std = hparams.stats[f'spk {speaker_id}']['pitch']['std']
+            spk_key = f'spk {speaker_id}'
+            if spk_key not in hparams.stats and 'spk 0' in hparams.stats:
+                spk_key = 'spk 0'
+            if spk_key not in hparams.stats:
+                raise KeyError(f"Speaker stats missing for 'spk {speaker_id}' and fallback 'spk 0' not in hparams.stats (keys: {list(hparams.stats.keys())})")
+            energy_mean = hparams.stats[spk_key]['energy']['mean']
+            energy_std = hparams.stats[spk_key]['energy']['std']
+            pitch_mean = hparams.stats[spk_key]['pitch']['mean']
+            pitch_std = hparams.stats[spk_key]['pitch']['std']
             if energy_std == 0 or pitch_std == 0:
                 raise ValueError(f'Speaker stats not initialized for speaker ID {speaker_id}.')
             src_energy_stats = source_stats['energy'] if source_stats is not None else None
@@ -373,13 +261,10 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
                 pitch_vals, pitch_zero,
                 {'mean': pitch_mean, 'std': pitch_std},
                 src_pitch_stats)
-            
-            # Apply variance exaggeration to Energy and Pitch (after normalization)
-            # Note: Since data is z-normalized (mean~0, std~1), mu is effectively 0.
-            # So the formula simplifies to x' = alpha * x
+
             if alpha_energy != 1.0:
                 energy_vals[~energy_zero] *= alpha_energy
-            
+
             if alpha_pitch != 1.0:
                 pitch_vals[~pitch_zero] *= alpha_pitch
 
@@ -391,13 +276,9 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
             'energy_preds': ext_energy.cuda(gpu, non_blocking=True).float(),
             'pitch_preds': ext_pitch.cuda(gpu, non_blocking=True).float()
         }
-    # perform inference
-    inputs = (symbols, dur_factors, energy_factors, pitch_factors, input_lengths,
-              energy_refs, pitch_refs, mel_spec_refs, ref_lengths, speaker_ids)
+    inputs = (symbols, dur_factors, energy_factors, pitch_factors, input_lengths, speaker_ids)
     encoder_preds, decoder_preds, alignments = model.inference(
         inputs, pitch_transform, hparams, external_tensors,
-        neutralize_prosody=neutralize_prosody,
-        neutralize_speaker_encoder=neutralize_speaker_encoder,
         external_embeddings=external_embeddings,
         external_accent_emb=external_accent_emb
     )
@@ -414,7 +295,7 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
     mel_spec_preds = mel_spec_preds.detach().cpu().numpy()  # (B, n_mel_channels, T_max)
     output_lengths = output_lengths.detach().cpu().numpy()  # (B)
     weights = weights.detach().cpu().numpy()  # (B, L_max, T_max)
-    
+
     # save preds for each element in the batch
     predictions = {}
     for line_idx in range(mel_spec_preds.shape[0]):
@@ -430,168 +311,75 @@ def generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_facto
         # save generated spectrogram
         file_name = file_names[line_idx]
         np.savez(os.path.join(output_dir, f'{file_name}.npz'), mel_spec=mel_spec_pred)
-        # store predictions 
+        # store predictions
         predictions[f'{file_name}'] = [duration_pred, duration_int, energy_pred, pitch_pred, mel_spec_pred, weight]
-    
-    # save plots and generate audio using Griffin-Lim
-    if use_griffin_lim:
-        items = [[file_name, mel_spec, weight] for file_name, (_, _, _, _, mel_spec, weight) in predictions.items()]
-        launch_multi_process(iterable=items, func=save_mel_spec_plot_and_audio, n_jobs=n_jobs,
-                             timer_verbose=False, output_dir=output_dir, hparams=hparams)
-    elif vocoder is not None:
-        for file_name, (_, _, _, _, mel_spec, _) in predictions.items():
-            mel_for_vocoder = _smooth_mel_for_vocoder(mel_spec) if reduce_buzz else mel_spec
-            audio = vocoder.infer(mel_for_vocoder)
-            if reduce_buzz:
-                audio = _gentle_lowpass(audio, hparams.sampling_rate)
-            audio_int16 = (audio * 32767.5).clip(min=-32768, max=32767).astype(np.int16)
-            wavfile.write(os.path.join(output_dir, f'{file_name}.wav'), hparams.sampling_rate, audio_int16)
-    
+
+    if vocoder is None:
+        raise ValueError(
+            "HiFi-GAN vocoder required for mel-to-wave. "
+            "Provide --vocoder_checkpoint in synthesize.py or load a vocoder before calling generate."
+        )
+    for file_name, (_, _, _, _, mel_spec, weight) in predictions.items():
+        plot_2d_data(data=(mel_spec, weight),
+                     x_labels=('Mel-Spec Prediction', 'Alignments'),
+                     filename=os.path.join(output_dir, file_name + '.png'))
+        audio = vocoder.infer(mel_spec)
+        audio_int16 = (audio * 32767.5).clip(min=-32768, max=32767).astype(np.int16)
+        wavfile.write(os.path.join(output_dir, f'{file_name}.wav'), hparams.sampling_rate, audio_int16)
+
     return predictions
 
 
-def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_dir, hparams,
+def generate_mel_specs(model, sentences, file_names, speaker_ids, output_dir, hparams,
                        dur_factors=None, energy_factors=None, pitch_factors=None, batch_size=1,
-                       n_jobs=1, use_griffin_lim=False, get_time_perf=False, external_prosody=None,
-                       vocoder=None, source_stats=None, reduce_buzz=False,
-                       neutralize_prosody=False, neutralize_speaker_encoder=False,
-                       alpha_dur=None, alpha_pitch=None, alpha_energy=None, 
+                       n_jobs=1, get_time_perf=False, external_prosody=None,
+                       vocoder=None, source_stats=None,
+                       alpha_dur=None, alpha_pitch=None, alpha_energy=None,
                        external_embeddings=None, external_accent_emb=None):
-    ''' Generate mel-specs using Daft-Exprt
-
-        sentences = [
-            sentence_1,
-            ...
-            sentence_N
-        ]
-        each sentence is a list of symbols:
-            sentence = [
-                [symbols_word_1],
-                word_boundary_symbol,
-                [symbols_word_2],
-                word_boundary_symbol,
-                ...
-            ]
-        for example, here is a sentence of 5 words, 6 word boundaries and a total of 17 symbols:
-            sentence = [['IH0', 'Z'], ' ', ['IH0', 'T'], ',', ['AH0'], ' ', ['G', 'UH1', 'D'], ' ', ['CH', 'OY1', 'S'], '?', '~']
-        
-        file_names = [
-            file_name_1,
-            ...
-            file_name_N
-        ]
-        
-        speaker_ids = [
-            speaker_id_1,
-            ...
-            speaker_id_N
-        ]
-        
-        refs = [
-            path_to_ref_1.npz,
-            ...
-            path_to_ref_N.npz
-        ]
-        
-        dur_factors = [
-            [factor_sentence_1_symbol_1, factor_sentence_1_symbol_2, ...],
-            ...
-            [factor_sentence_N_symbol_1, factor_sentence_N_symbol_2, ...]
-        ]
-        if None, duration predictions are not modified
-        
-        energy_factors = [
-            [factor_sentence_1_symbol_1, factor_sentence_1_symbol_2, ...],
-            ...
-            [factor_sentence_N_symbol_1, factor_sentence_N_symbol_2, ...]
-        ]
-        if None, energy predictions are not modified
-        
-        pitch_factors = [
-            "transform",
-            [
-                [factor_sentence_1_symbol_1, factor_sentence_1_symbol_2, ...],
-                ...
-                [factor_sentence_N_symbol_1, factor_sentence_N_symbol_2, ...]
-            ] 
-        ]
-        There are 2 types of transforms:
-            - pitch shift: "add"
-            - pitch multiply: "multiply"
-        if None, pitch predictions are not modified
-    '''
-    # set default values if prosody factors are None
+    ''' Generate mel-specs using Daft-Exprt. Synthesis uses external_accent_emb only; no refs. '''
     dur_factors = [None for _ in range(len(sentences))] if dur_factors is None else dur_factors
     energy_factors = [None for _ in range(len(sentences))] if energy_factors is None else energy_factors
     pitch_factors = ['add', [None for _ in range(len(sentences))]] if pitch_factors is None else pitch_factors
-    # get pitch transform
     pitch_transform = pitch_factors[0].lower()
     pitch_factors = pitch_factors[1]
-    assert(pitch_transform in ['add', 'multiply']), _logger.error(f'Pitch transform "{pitch_transform}" is not currently supported')
-    # check lists have the same size
-    assert (len(file_names) == len(sentences)), _logger.error(f'{len(file_names)} filenames but there are {len(sentences)} sentences to generate')
-    assert (len(speaker_ids) == len(sentences)), _logger.error(f'{len(speaker_ids)} speaker IDs but there are {len(sentences)} sentences to generate')
-    assert (len(refs) == len(sentences)), _logger.error(f'{len(refs)} references but there are {len(sentences)} sentences to generate')
-    assert (len(dur_factors) == len(sentences)), _logger.error(f'{len(dur_factors)} duration factors but there are {len(sentences)} sentences to generate')
-    assert (len(energy_factors) == len(sentences)), _logger.error(f'{len(energy_factors)} energy factors but there are {len(sentences)} sentences to generate')
-    assert (len(pitch_factors) == len(sentences)), _logger.error(f'{len(pitch_factors)} pitch factors but there are {len(sentences)} sentences to generate')
-      
+    assert pitch_transform in ['add', 'multiply']
+    assert len(file_names) == len(sentences)
+    assert len(speaker_ids) == len(sentences)
+    assert len(dur_factors) == len(sentences)
+    assert len(energy_factors) == len(sentences)
+    assert len(pitch_factors) == len(sentences)
     if external_prosody is not None:
-        assert len(external_prosody) == len(sentences), \
-            _logger.error(f'{len(external_prosody)} external prosody entries but {len(sentences)} sentences to generate')
-    # we don't need computational graph for inference
-    model.eval()  # set eval mode
+        assert len(external_prosody) == len(sentences)
+
+    model.eval()
     os.makedirs(output_dir, exist_ok=True)
     predictions, time_per_batch = {}, []
     sentence_chunks = list(chunker(sentences, batch_size))
-    ref_chunks = list(chunker(refs, batch_size))
     dur_chunks = list(chunker(dur_factors, batch_size))
     energy_chunks = list(chunker(energy_factors, batch_size))
     pitch_chunks = list(chunker(pitch_factors, batch_size))
     speaker_chunks = list(chunker(speaker_ids, batch_size))
     file_chunks = list(chunker(file_names, batch_size))
-    if external_prosody is not None:
-        external_chunks = list(chunker(external_prosody, batch_size))
-    else:
-        external_chunks = [None] * len(sentence_chunks)
-    
-    if external_embeddings is not None:
-        external_embeddings_chunks = list(chunker(external_embeddings, batch_size))
-    else:
-        external_embeddings_chunks = [None] * len(sentence_chunks)
-    
-    if external_accent_emb is not None:
-        external_accent_chunks = list(chunker(external_accent_emb, batch_size))
-    else:
-        external_accent_chunks = [None] * len(sentence_chunks)
+    external_chunks = list(chunker(external_prosody, batch_size)) if external_prosody is not None else [None] * len(sentence_chunks)
+    external_embeddings_chunks = list(chunker(external_embeddings, batch_size)) if external_embeddings is not None else [None] * len(sentence_chunks)
+    external_accent_chunks = list(chunker(external_accent_emb, batch_size)) if external_accent_emb is not None else [None] * len(sentence_chunks)
 
     with torch.no_grad():
         for idx in range(len(sentence_chunks)):
-            batch_sentences = sentence_chunks[idx]
-            batch_refs = ref_chunks[idx]
-            batch_dur_factors = dur_chunks[idx]
-            batch_energy_factors = energy_chunks[idx]
-            batch_pitch_factors = pitch_chunks[idx]
-            batch_speaker_ids = speaker_chunks[idx]
-            batch_file_names = file_chunks[idx]
-            batch_external = external_chunks[idx] if external_chunks[idx] is not None else None
-            batch_external_embeddings = external_embeddings_chunks[idx] if external_embeddings_chunks[idx] is not None else None
-            batch_accent_emb = external_accent_chunks[idx] if external_accent_chunks[idx] is not None else None
-
+            batch_external = external_chunks[idx]
+            batch_external_embeddings = external_embeddings_chunks[idx]
+            batch_accent_emb = external_accent_chunks[idx]
             sentence_begin = time.time() if get_time_perf else None
-            batch_predictions =  generate_batch_mel_specs(model, batch_sentences, batch_refs, batch_dur_factors,
-                                                              batch_energy_factors, batch_pitch_factors, pitch_transform,
-                                                              batch_speaker_ids, batch_file_names, output_dir, hparams,
-                                                              n_jobs, use_griffin_lim, batch_external, vocoder,
-                                                              source_stats=source_stats, reduce_buzz=reduce_buzz,
-                                                              neutralize_prosody=neutralize_prosody,
-                                                              neutralize_speaker_encoder=neutralize_speaker_encoder,
-                                                              alpha_dur=alpha_dur, alpha_pitch=alpha_pitch, alpha_energy=alpha_energy,
-                                                              external_embeddings=batch_external_embeddings,
-                                                              external_accent_emb=batch_accent_emb)
+            batch_predictions = generate_batch_mel_specs(
+                model, sentence_chunks[idx], dur_chunks[idx], energy_chunks[idx], pitch_chunks[idx],
+                pitch_transform, speaker_chunks[idx], file_chunks[idx], output_dir, hparams,
+                n_jobs, batch_external, vocoder,
+                source_stats=source_stats,
+                alpha_dur=alpha_dur, alpha_pitch=alpha_pitch, alpha_energy=alpha_energy,
+                external_embeddings=batch_external_embeddings, external_accent_emb=batch_accent_emb)
             predictions.update(batch_predictions)
             time_per_batch += [time.time() - sentence_begin] if get_time_perf else []
-    
+
     # display overall time performance
     if get_time_perf:
         # get duration of each sentence
@@ -607,7 +395,7 @@ def generate_mel_specs(model, sentences, file_names, speaker_ids, refs, output_d
         _logger.info(f'')
         _logger.info(f'{len(predictions)} sentences ({sum(durations):.2f}s) generated in {sum(time_per_batch):.2f}s')
         _logger.info(f'DaftExprt RTF: {sum(durations)/sum(time_per_batch):.2f}')
-    
+
     return predictions
 
 
@@ -638,7 +426,7 @@ def extract_reference_parameters(audio_ref, output_dir, hparams, ref_name=None):
             energy = energy[:min_len]
         if mel_spec.shape[1] > min_len:
             mel_spec = mel_spec[:, :min_len]
-            
+
         assert(len(pitch) == mel_spec.shape[1]), f'{len(pitch)} -- {mel_spec.shape[1]}'
         assert(len(energy) == mel_spec.shape[1]), f'{len(energy)} -- {mel_spec.shape[1]}'
         # save references to .npz file
@@ -652,7 +440,7 @@ def prepare_sentences_for_inference(text_file, output_dir, hparams, n_jobs):
     if os.path.exists(output_dir):
         rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=False)
-    
+
     # extract sentences to synthesize
     assert(os.path.isfile(text_file)), _logger.error(f'There is no such file {text_file}')
     with open(os.path.join(text_file), 'r', encoding='utf-8') as f:
@@ -672,6 +460,6 @@ def prepare_sentences_for_inference(text_file, output_dir, hparams, n_jobs):
                     item = '{' + ' '.join(item) + '}'
                 text = f'{text} {item} '
             text = collapse_whitespace(text).strip()
-            f.write(f'{file_name}|{text}\n')    
+            f.write(f'{file_name}|{text}\n')
 
     return sentences, file_names

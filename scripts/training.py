@@ -98,27 +98,19 @@ def pre_process(pre_process_args):
     with open(stats_file, 'w') as f:
         json.dump(stats, f, indent=4, sort_keys=True)
 
+    # compute ECAPA speaker embeddings for training and validation file lists
+    from daft_exprt.ecapa_embeddings import compute_ecapa_for_file_lists
+    compute_ecapa_for_file_lists(data_set_dir, hparams.training_files, hparams.validation_files)
+
 
 def train(train_args):
     ''' Train Daft-Exprt on the pre-processed data sets
     '''
-    # check config
-    # check_train_config(hparams)
-    
-    import sys
-    print(f"DEBUG: sys.executable: {sys.executable}")
-    try:
-        import matplotlib
-        print(f"DEBUG: matplotlib file: {matplotlib.__file__}")
-    except ImportError as e:
-        print(f"DEBUG: Could not import matplotlib: {e}")
-
     # launch training in distributed mode or not
     training_script = os.path.join(PROJECT_ROOT, 'src', 'daft_exprt', 'train.py')
     process = [sys.executable, f'{training_script}',
                '--data_set_dir', f'{data_set_dir}',
                '--config_file', f'{config_file}',
-               '--benchmark_dir', f'{benchmark_dir}',
                '--log_file', f"{os.path.join(output_directory, 'logs', 'training.log')}",
                '--world_size', f'{train_args.world_size}',
                '--rank', f'{train_args.rank}',
@@ -195,8 +187,7 @@ if __name__ == '__main__':
     validation_files = os.path.join(output_directory, f'validation_{args.language}.txt')
     config_file = os.path.abspath(args.config_file) if args.config_file else os.path.join(output_directory, 'config.json')
     stats_file = os.path.join(output_directory, 'stats.json')
-    benchmark_dir = os.path.join(PROJECT_ROOT, 'scripts', 'benchmarks')
-    
+
     # find all speakers in data_set_dir if not specified in the args
     args.speakers = list_all_speakers(data_set_dir) if len(args.speakers) == 0 else args.speakers
     
