@@ -45,11 +45,12 @@ class DaftExprtLoss(nn.Module):
         
         # compute adversarial speaker objective (only if speaker_preds provided)
         if speaker_preds is not None:
-            speaker_loss = self.CrossEntropy(speaker_preds, speaker_ids)
+            speaker_ce_raw = self.CrossEntropy(speaker_preds, speaker_ids)
             speaker_weight = self.update_adversarial_weight(iteration)
-            speaker_loss = speaker_weight * speaker_loss
+            speaker_loss = speaker_weight * speaker_ce_raw
         else:
             speaker_loss = torch.tensor([0.]).to(mel_spec_preds.device).float()
+            speaker_ce_raw = torch.tensor([0.]).to(mel_spec_preds.device).float()
         
         # compute L2 penalized loss on FiLM scalar post-multipliers
         if self.post_mult_weight != 0. and isinstance(post_multipliers, torch.Tensor):
@@ -74,6 +75,7 @@ class DaftExprtLoss(nn.Module):
 
         individual_loss = {
             'speaker_loss': speaker_loss.item() if isinstance(speaker_loss, torch.Tensor) else speaker_loss,
+            'speaker_ce_raw': speaker_ce_raw.item() if isinstance(speaker_ce_raw, torch.Tensor) else speaker_ce_raw,
             'post_mult_loss': post_mult_loss.item() if isinstance(post_mult_loss, torch.Tensor) else post_mult_loss,
             'mel_spec_l1_loss': mel_spec_l1_loss.item(),
             'mel_spec_l2_loss': mel_spec_l2_loss.item()

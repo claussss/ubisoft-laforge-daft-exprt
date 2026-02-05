@@ -160,34 +160,35 @@ def update_learning_rate(hparams, iteration):
     return learning_rate
 
 
-def validate(gpu, model, criterion, val_loader, hparams):
-    ''' Handles all the validation scoring and printing
+def validate(gpu, model, criterion, val_loader, hparams, stats_manager=None):
+    ''' Handles all the validation scoring and printing.
 
-    :param gpu:             GPU ID that hosts the model
-    :param model:           model to evaluate
-    :param criterion:       criterion used for training
-    :param val_loader:      validation Data Loader
-    :param hparams:         hyper-params used for training
-
-    :return: validation loss score
+    Uses the same prosody normalization as training when stats_manager is provided,
+    so validation loss is comparable to training loss.
     '''
-    # initialize variables
     val_loss = 0.
     val_indiv_loss = {
         'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-        'speaker_loss': 0., 'post_mult_loss': 0.
+        'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.
     }
     val_targets, val_outputs = [], []
-    
-    # set eval mode
+
+    if stats_manager is None:
+        stats_manager = DynamicSpeakerStatsManager(hparams)
+
     model.eval()
     with torch.no_grad():
-        # iterate over validation set
         for i, batch in enumerate(val_loader):
             if hparams.multiprocessing_distributed:
                 inputs, targets = model.module.parse_batch(gpu, batch)
             else:
                 inputs, targets = model.parse_batch(gpu, batch)
+
+            inputs = stats_manager.process_batch(inputs, hparams.device)
+            norm_symbols_energy = inputs[3]
+            norm_symbols_pitch = inputs[4]
+            targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
+
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration=0)
             val_targets.append(targets)
@@ -195,7 +196,6 @@ def validate(gpu, model, criterion, val_loader, hparams):
             val_loss += loss.item()
             for key in val_indiv_loss:
                 val_indiv_loss[key] += individual_loss[key]
-        # normalize losses
         val_loss = val_loss / (i + 1)
         for key in val_indiv_loss:
             val_indiv_loss[key] = val_indiv_loss[key] / (i + 1)
@@ -362,7 +362,7 @@ def train(gpu, hparams, log_file):
     tot_loss = 0.
     indiv_loss = {
         'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-        'speaker_loss': 0., 'post_mult_loss': 0.
+        'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.
     }
     total_time = 0.
     start = time.time()
@@ -421,11 +421,6 @@ def train(gpu, hparams, log_file):
             loss.backward()
             accumulation_step += 1
 
-            # Log per-step (per-batch) loss and breakdown so output appears every step between epochs
-            if hparams.rank == 0 and not math.isnan(tot_loss):
-                step_loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in indiv_loss.items() if v > 0])
-                _logger.info(f'  Step loss (accu {accumulation_step}/{hparams.accumulation_steps}): {tot_loss:.6f} — {step_loss_str}')
-
             # ---------------------------------------------------------
             # accumulate gradient
             # ---------------------------------------------------------
@@ -465,7 +460,7 @@ def train(gpu, hparams, log_file):
                 if iteration % hparams.iters_check_for_model_improvement == 0:
                     # validate model
                     _logger.info('Validating....')
-                    val_loss, val_indiv_loss, val_targets, val_outputs = validate(gpu, model, criterion, val_loader, hparams)
+                    val_loss, val_indiv_loss, val_targets, val_outputs = validate(gpu, model, criterion, val_loader, hparams, stats_manager)
                     if hparams.rank == 0:
                         # display remaining time
                         _logger.info(f"Validation loss {iteration}: {val_loss:.6f} ")
@@ -512,7 +507,7 @@ def train(gpu, hparams, log_file):
                 tot_loss = 0.
                 indiv_loss = {
                     'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-                    'speaker_loss': 0., 'post_mult_loss': 0.
+                    'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.
                 }
                 start = time.time()
                 accumulation_step = 0
