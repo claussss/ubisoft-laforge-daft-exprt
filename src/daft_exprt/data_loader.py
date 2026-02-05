@@ -13,13 +13,16 @@ class DaftExprtDataLoader(Dataset):
         1) load features, symbols and speaker ID
         2) convert symbols to sequence of one-hot vectors
     '''
-    def __init__(self, data_file, hparams, shuffle=True):
+    def __init__(self, data_file, hparams, shuffle=True, return_raw_stats=False):
         # check data file exists and extract lines
         assert(os.path.isfile(data_file))
         with open(data_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         self.data = [line.strip().split(sep='|') for line in lines]
         self.hparams = hparams
+        # When return_raw_stats=True, don't normalize prosody features
+        # (DynamicSpeakerStatsManager will handle normalization instead)
+        self.return_raw_stats = return_raw_stats
 
         # shuffle
         if shuffle:
@@ -69,6 +72,11 @@ class DaftExprtDataLoader(Dataset):
             lines = f.readlines()
         energies = np.array([float(line.strip()) for line in lines])
 
+        # Override normalize flag if return_raw_stats is set
+        # (DynamicSpeakerStatsManager will handle normalization)
+        if self.return_raw_stats:
+            normalize = False
+
         # standardize energies based on speaker stats
         if normalize:
             zero_idxs = np.where(energies == 0.)[0]
@@ -88,6 +96,11 @@ class DaftExprtDataLoader(Dataset):
         with open(pitch, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         pitch = np.array([float(line.strip()) for line in lines])
+
+        # Override normalize flag if return_raw_stats is set
+        # (DynamicSpeakerStatsManager will handle normalization)
+        if self.return_raw_stats:
+            normalize = False
 
         # standardize voiced pitch based on speaker stats
         if normalize:
@@ -244,8 +257,10 @@ def prepare_data_loaders(hparams, num_workers=1, drop_last=True):
     :return: Data Loaders for train and validation sets
     '''
     # get data and collate function ready
-    train_set = DaftExprtDataLoader(hparams.training_files, hparams)
-    val_set = DaftExprtDataLoader(hparams.validation_files, hparams)
+    # return_raw_stats=True disables normalization in data_loader
+    # so DynamicSpeakerStatsManager can handle normalization on-the-fly
+    train_set = DaftExprtDataLoader(hparams.training_files, hparams, return_raw_stats=True)
+    val_set = DaftExprtDataLoader(hparams.validation_files, hparams, return_raw_stats=True)
     collate_fn = DaftExprtDataCollate(hparams)
 
     # get number of training examples
