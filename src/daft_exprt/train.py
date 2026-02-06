@@ -169,7 +169,8 @@ def validate(gpu, model, criterion, val_loader, hparams, stats_manager=None):
     val_loss = 0.
     val_indiv_loss = {
         'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-        'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.
+        'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.,
+        'energy_consistency_loss': 0., 'pitch_consistency_loss': 0.
     }
     val_targets, val_outputs = [], []
 
@@ -187,7 +188,10 @@ def validate(gpu, model, criterion, val_loader, hparams, stats_manager=None):
             inputs = stats_manager.process_batch(inputs, hparams.device)
             norm_symbols_energy = inputs[3]
             norm_symbols_pitch = inputs[4]
-            targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
+            frames_energy = inputs[6]
+            frames_pitch = inputs[7]
+            targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5],
+                       frames_energy, frames_pitch)
 
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration=0)
@@ -195,7 +199,7 @@ def validate(gpu, model, criterion, val_loader, hparams, stats_manager=None):
             val_outputs.append(outputs)
             val_loss += loss.item()
             for key in val_indiv_loss:
-                val_indiv_loss[key] += individual_loss[key]
+                val_indiv_loss[key] += individual_loss.get(key, 0.)
         val_loss = val_loss / (i + 1)
         for key in val_indiv_loss:
             val_indiv_loss[key] = val_indiv_loss[key] / (i + 1)
@@ -362,7 +366,8 @@ def train(gpu, hparams, log_file):
     tot_loss = 0.
     indiv_loss = {
         'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-        'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.
+        'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.,
+        'energy_consistency_loss': 0., 'pitch_consistency_loss': 0.
     }
     total_time = 0.
     start = time.time()
@@ -399,10 +404,14 @@ def train(gpu, hparams, log_file):
                 stats_manager.refresh_stats()
             inputs = stats_manager.process_batch(inputs, hparams.device)
 
-            # Sync normalized prosody into targets for loss (targets: dur, energy, pitch, mel, out_len, speaker_ids)
+            # Sync normalized prosody into targets for loss
+            # targets: (dur, energy, pitch, mel, out_len, speaker_ids, frames_energy, frames_pitch)
             norm_symbols_energy = inputs[3]
             norm_symbols_pitch = inputs[4]
-            targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5])
+            frames_energy = inputs[6]   # (B, T_max) frame-level energy for consistency loss
+            frames_pitch = inputs[7]    # (B, T_max) frame-level pitch for consistency loss
+            targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5],
+                       frames_energy, frames_pitch)
 
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size
@@ -507,7 +516,8 @@ def train(gpu, hparams, log_file):
                 tot_loss = 0.
                 indiv_loss = {
                     'mel_spec_l1_loss': 0., 'mel_spec_l2_loss': 0.,
-                    'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.
+                    'speaker_loss': 0., 'speaker_ce_raw': 0., 'post_mult_loss': 0.,
+                    'energy_consistency_loss': 0., 'pitch_consistency_loss': 0.
                 }
                 start = time.time()
                 accumulation_step = 0
