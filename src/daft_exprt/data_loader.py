@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 
@@ -6,6 +7,8 @@ import torch
 
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+
+_logger = logging.getLogger(__name__)
 
 
 class DaftExprtDataLoader(Dataset):
@@ -29,13 +32,16 @@ class DaftExprtDataLoader(Dataset):
             random.seed(hparams.seed)
             random.shuffle(self.data)
 
-    def get_mel_spec(self, mel_spec):
-        ''' Extract PyTorch float tensor from .npy mel-spec file
+    def get_mel_spec(self, mel_spec_path):
+        ''' Extract PyTorch float tensor from .npy mel-spec file.
+        Raises EOFError/OSError with path in message if file is truncated/corrupt.
         '''
-        # transform to PyTorch tensor and check size
-        mel_spec = torch.from_numpy(np.load(mel_spec))
-        assert(mel_spec.size(0) == self.hparams.n_mel_channels)
-
+        try:
+            arr = np.load(mel_spec_path)
+        except (EOFError, OSError) as e:
+            raise type(e)(f"{e} (file: {mel_spec_path})") from e
+        mel_spec = torch.from_numpy(arr)
+        assert mel_spec.size(0) == self.hparams.n_mel_channels
         return mel_spec
 
     def get_symbols_and_durations(self, markers):
@@ -131,6 +137,7 @@ class DaftExprtDataLoader(Dataset):
         spk_emb = os.path.join(features_dir, f'{feature_file}.spk_emb.npy')
 
         # extract data
+        path_info = os.path.join(features_dir, feature_file)
         mel_spec = self.get_mel_spec(mel_spec)
         symbols, durations_float, durations_int = self.get_symbols_and_durations(markers)
         symbols_energy = self.get_energies(symbols_energy, speaker_id)
@@ -138,22 +145,54 @@ class DaftExprtDataLoader(Dataset):
         symbols_pitch = self.get_pitch(symbols_pitch, speaker_id)
         frames_pitch = self.get_pitch(frames_pitch, speaker_id, normalize=False)
 
-        # check everything is correct with sizes
-        assert(len(symbols_energy) == len(symbols))
-        assert(len(symbols_pitch) == len(symbols))
-        assert(len(frames_energy) == mel_spec.size(1))
-        assert(len(frames_pitch) == mel_spec.size(1))
-        assert(torch.sum(durations_int) == mel_spec.size(1))
+        # check everything is correct with sizes (raise with path for skip/retry logic)
+        if len(symbols_energy) != len(symbols):
+            raise ValueError(
+                f"symbols_energy vs symbols length mismatch ({len(symbols_energy)} vs {len(symbols)}) for {path_info}"
+            )
+        if len(symbols_pitch) != len(symbols):
+            raise ValueError(
+                f"symbols_pitch vs symbols length mismatch ({len(symbols_pitch)} vs {len(symbols)}) for {path_info}"
+            )
+        if len(frames_energy) != mel_spec.size(1):
+            raise ValueError(
+                f"frames_energy vs mel frames mismatch ({len(frames_energy)} vs {mel_spec.size(1)}) for {path_info}"
+            )
+        if len(frames_pitch) != mel_spec.size(1):
+            raise ValueError(
+                f"frames_pitch vs mel frames mismatch ({len(frames_pitch)} vs {mel_spec.size(1)}) for {path_info}"
+            )
+        if torch.sum(durations_int) != mel_spec.size(1):
+            raise ValueError(
+                f"durations_int sum vs mel frames mismatch ({torch.sum(durations_int).item()} vs {mel_spec.size(1)}) for {path_info}"
+            )
 
         spk_emb_tensor = None
         if os.path.isfile(spk_emb):
-            spk_emb_tensor = torch.from_numpy(np.load(spk_emb)).float()
+            try:
+                spk_emb_tensor = torch.from_numpy(np.load(spk_emb)).float()
+            except (EOFError, OSError) as e:
+                raise type(e)(f"{e} (file: {spk_emb})") from e
 
         return symbols, durations_float, durations_int, symbols_energy, symbols_pitch, \
             frames_energy, frames_pitch, mel_spec, speaker_id, features_dir, feature_file, spk_emb_tensor
 
     def __getitem__(self, index):
-        return self.get_data(self.data[index])
+        """Load sample at index; on corrupt/mismatch skip to next index (up to max_retries)."""
+        skip_errors = (EOFError, OSError, ValueError, AssertionError)
+        max_retries = min(len(self.data), 100)
+        last_error = None
+        for attempt in range(max_retries):
+            idx = (index + attempt) % len(self.data)
+            try:
+                return self.get_data(self.data[idx])
+            except skip_errors as e:
+                last_error = e
+                _logger.warning(
+                    "Skipping sample (attempt %d/%d): %s",
+                    attempt + 1, max_retries, e,
+                )
+        raise last_error
 
     def __len__(self):
         return len(self.data)
