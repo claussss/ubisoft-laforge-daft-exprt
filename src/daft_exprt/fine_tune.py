@@ -61,6 +61,7 @@ def fine_tuning(hparams):
     # ==============================================
     model.eval()  # set eval mode
     start = time.time()
+    n_written, n_skipped_shape, n_skipped_short = 0, 0, 0
     with torch.no_grad():
         # iterate over examples of train set
         for idx, batch in enumerate(train_loader):
@@ -88,21 +89,22 @@ def fine_tuning(hparams):
                 speaker_name = [speaker for speaker in hparams.speakers if feature_dir.endswith(speaker)]
                 assert(len(speaker_name) == 1), _logger.error(f'{feature_dir} -- {feature_file} -- {speaker_name}')
                 speaker_name = speaker_name[0]
-                # read wav file to range [-1, 1] in np.float32
+                # read wav file from dataset dir (audio); markers from feature dir (precomputed features)
                 wav_file = os.path.join(hparams.data_set_dir, speaker_name, 'wavs', f'{feature_file}.wav')
                 wav, fs = librosa.load(wav_file, sr=hparams.sampling_rate)
                 wav = rescale_wav_to_float32(wav)
-                # crop audio to remove tailing silences based on markers file
-                markers_file = os.path.join(hparams.data_set_dir, speaker_name, 'align', f'{feature_file}.markers')
+                markers_file = os.path.join(feature_dir, f'{feature_file}.markers')
                 with open(markers_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
                 sent_begin = float(lines[0].strip().split(sep='\t')[0])
                 sent_end = float(lines[-1].strip().split(sep='\t')[1])
                 wav = wav[int(sent_begin * fs): int(sent_end * fs)]
-                # check target and predicted mel-spec have the same size
+                # check target and predicted mel-spec have the same size (skip on mismatch to avoid crashing)
                 mel_spec_tgt = mel_spectrogram_HiFi(wav, hparams)
-                assert(mel_spec_tgt.shape == mel_spec_pred.shape), \
-                    _logger.error(f'{feature_dir} -- {feature_file} -- {mel_spec_tgt.shape} -- {mel_spec_pred.shape}')
+                if mel_spec_tgt.shape != mel_spec_pred.shape:
+                    n_skipped_shape += 1
+                    _logger.warning(f'{feature_dir} -- {feature_file} -- shape mismatch tgt {mel_spec_tgt.shape} pred {mel_spec_pred.shape}, skipping')
+                    continue
                 # save audio and mel-spec if they have the correct size (superior to 1s)
                 if len(wav) >= fs:
                     # convert to int16
@@ -114,6 +116,7 @@ def fine_tuning(hparams):
                     try:
                         np.save(mel_spec_file, mel_spec_pred)
                         write(wav_file, fs, wav)
+                        n_written += 1
                     except Exception as e:
                         _logger.error(f'{feature_dir} -- {feature_file} -- {e}')
                         if os.path.isfile(mel_spec_file):
@@ -121,7 +124,9 @@ def fine_tuning(hparams):
                         if os.path.isfile(wav_file):
                             os.remove(wav_file)
                 else:
+                    n_skipped_short += 1
                     _logger.warning(f'{feature_dir} -- {feature_file} -- Ignoring because audio is < 1s')
+    _logger.info(f'Fine-tuning dataset summary: written={n_written}, skipped (shape mismatch)={n_skipped_shape}, skipped (<1s)={n_skipped_short}')
 
 
 def launch_fine_tuning(data_set_dir, config_file, log_file):

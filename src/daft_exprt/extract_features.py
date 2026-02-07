@@ -361,8 +361,8 @@ def mel_spectrogram_HiFi(wav, hparams):
     pad = int((n_fft - hop_size) / 2)
     wav = torch.nn.functional.pad(wav.unsqueeze(0).unsqueeze(0), (pad, pad), mode='reflect').squeeze(0).squeeze(0)
     
-    # get mel filter bank
-    mel_filter_bank = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)  # (n_mels, 1 + n_fft/2)
+    # get mel filter bank (librosa 0.10+ uses keyword-only args)
+    mel_filter_bank = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)  # (n_mels, 1 + n_fft/2)
     mel_filter_bank = torch.from_numpy(mel_filter_bank).float()  # (n_mels, 1 + n_fft/2)
     # build hann window
     hann_window = torch.hann_window(n_fft)
