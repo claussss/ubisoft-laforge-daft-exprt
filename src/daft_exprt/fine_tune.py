@@ -66,8 +66,9 @@ def fine_tuning(hparams):
         for idx, batch in enumerate(train_loader):
             estimate_required_time(nb_items_in_list=len(train_loader), current_index=idx,
                                    time_elapsed=time.time() - start, interval=1)
-            inputs, _, file_ids = model.parse_batch(0, batch)
-            feature_dirs, feature_files = file_ids  # (B, ) and (B, )
+            inputs, _ = model.parse_batch(0, batch)
+            # feature_dirs and feature_files are at indices 11 and 12 in the collated batch
+            feature_dirs, feature_files = batch[11], batch[12]
             
             outputs = model(inputs)
             _, _, _, decoder_preds, _ = outputs
