@@ -185,13 +185,15 @@ def validate(gpu, model, criterion, val_loader, hparams, stats_manager=None):
             else:
                 inputs, targets = model.parse_batch(gpu, batch)
 
+            # Save RAW frames prosody BEFORE normalization for consistency losses
+            raw_frames_energy = inputs[6]
+            raw_frames_pitch = inputs[7]
+
             inputs = stats_manager.process_batch(inputs, hparams.device)
             norm_symbols_energy = inputs[3]
             norm_symbols_pitch = inputs[4]
-            frames_energy = inputs[6]
-            frames_pitch = inputs[7]
             targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5],
-                       frames_energy, frames_pitch)
+                       raw_frames_energy, raw_frames_pitch)
 
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration=0)
@@ -400,18 +402,21 @@ def train(gpu, hparams, log_file):
                 _logger.info(">> DYNAMIC STATS ENABLED: Normalization on-the-fly using random subsets.")
                 stats_manager = DynamicSpeakerStatsManager(hparams)
 
+            # Save RAW frames prosody BEFORE normalization for consistency losses.
+            # The frozen PitchPredictor outputs raw pitch, so the GT must also be raw.
+            raw_frames_energy = inputs[6]
+            raw_frames_pitch = inputs[7]
+
             if iteration % stats_refresh_interval == 0:
                 stats_manager.refresh_stats()
             inputs = stats_manager.process_batch(inputs, hparams.device)
 
-            # Sync normalized prosody into targets for loss
-            # targets: (dur, energy, pitch, mel, out_len, speaker_ids, frames_energy, frames_pitch)
+            # Sync normalized symbol-level prosody into targets for the model,
+            # but keep frame-level prosody RAW for consistency losses.
             norm_symbols_energy = inputs[3]
             norm_symbols_pitch = inputs[4]
-            frames_energy = inputs[6]   # (B, T_max) frame-level energy for consistency loss
-            frames_pitch = inputs[7]    # (B, T_max) frame-level pitch for consistency loss
             targets = (targets[0], norm_symbols_energy, norm_symbols_pitch, targets[3], targets[4], targets[5],
-                       frames_energy, frames_pitch)
+                       raw_frames_energy, raw_frames_pitch)
 
             outputs = model(inputs)
             loss, individual_loss = criterion(outputs, targets, iteration)  # loss / batch_size
